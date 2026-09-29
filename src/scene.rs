@@ -50,6 +50,12 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    /// Device-pixel offset subtracted from primitives as they are inserted. Non-zero only
+    /// while the window is magnified; see [`crate::Magnification`].
+    view_translation: Point<ScaledPixels>,
+    /// When set, primitives entirely outside these device bounds are dropped. Used while
+    /// magnified, where most of the laid-out content is off screen.
+    view_cull_bounds: Option<Bounds<ScaledPixels>>,
 }
 
 #[expect(missing_docs)]
@@ -66,6 +72,21 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.view_translation = Point::default();
+        self.view_cull_bounds = None;
+    }
+
+    /// Sets the device-space view transform applied by [`Self::insert_primitive`] and
+    /// [`Self::push_layer`]: primitives are moved by `-translation` and, if `cull_bounds`
+    /// is set, dropped when they fall entirely outside it. Primitives replayed from a
+    /// previous scene already carry the transform and are not moved again.
+    pub(crate) fn set_view_transform(
+        &mut self,
+        translation: Point<ScaledPixels>,
+        cull_bounds: Option<Bounds<ScaledPixels>>,
+    ) {
+        self.view_translation = translation;
+        self.view_cull_bounds = cull_bounds;
     }
 
     pub fn len(&self) -> usize {
@@ -73,6 +94,14 @@ impl Scene {
     }
 
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
+        let bounds = Bounds {
+            origin: bounds.origin - self.view_translation,
+            size: bounds.size,
+        };
+        self.push_layer_untransformed(bounds);
+    }
+
+    fn push_layer_untransformed(&mut self, bounds: Bounds<ScaledPixels>) {
         let order = self.primitive_bounds.insert(bounds);
         self.layer_stack.push(order);
         self.paint_operations
@@ -86,9 +115,19 @@ impl Scene {
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
         let mut primitive = primitive.into();
-        let clipped_bounds = primitive
+        if self.view_translation != Point::default() {
+            primitive.translate(self.view_translation);
+        }
+        self.insert_primitive_untransformed(primitive);
+    }
+
+    fn insert_primitive_untransformed(&mut self, mut primitive: Primitive) {
+        let mut clipped_bounds = primitive
             .bounds()
             .intersect(&primitive.content_mask().bounds);
+        if let Some(cull_bounds) = &self.view_cull_bounds {
+            clipped_bounds = clipped_bounds.intersect(cull_bounds);
+        }
 
         if clipped_bounds.is_empty() {
             return;
@@ -141,8 +180,10 @@ impl Scene {
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         for operation in &prev_scene.paint_operations[range] {
             match operation {
-                PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
-                PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
+                PaintOperation::Primitive(primitive) => {
+                    self.insert_primitive_untransformed(primitive.clone())
+                }
+                PaintOperation::StartLayer(bounds) => self.push_layer_untransformed(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
             }
         }
@@ -242,6 +283,57 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
+        }
+    }
+
+    /// Moves the primitive, its content mask and any sprite transformation by `-offset`.
+    pub(crate) fn translate(&mut self, offset: Point<ScaledPixels>) {
+        fn shift(bounds: &mut Bounds<ScaledPixels>, offset: Point<ScaledPixels>) {
+            bounds.origin = bounds.origin - offset;
+        }
+        fn shift_matrix(matrix: &mut TransformationMatrix, offset: Point<ScaledPixels>) {
+            *matrix = translated_sprite_transform(*matrix, offset);
+        }
+        match self {
+            Primitive::Shadow(shadow) => {
+                shift(&mut shadow.bounds, offset);
+                shift(&mut shadow.element_bounds, offset);
+                shift(&mut shadow.content_mask.bounds, offset);
+            }
+            Primitive::Quad(quad) => {
+                shift(&mut quad.bounds, offset);
+                shift(&mut quad.content_mask.bounds, offset);
+            }
+            Primitive::Path(path) => {
+                shift(&mut path.bounds, offset);
+                shift(&mut path.content_mask.bounds, offset);
+                for vertex in &mut path.vertices {
+                    vertex.xy_position = vertex.xy_position - offset;
+                    shift(&mut vertex.content_mask.bounds, offset);
+                }
+            }
+            Primitive::Underline(underline) => {
+                shift(&mut underline.bounds, offset);
+                shift(&mut underline.content_mask.bounds, offset);
+            }
+            Primitive::MonochromeSprite(sprite) => {
+                shift(&mut sprite.bounds, offset);
+                shift(&mut sprite.content_mask.bounds, offset);
+                shift_matrix(&mut sprite.transformation, offset);
+            }
+            Primitive::SubpixelSprite(sprite) => {
+                shift(&mut sprite.bounds, offset);
+                shift(&mut sprite.content_mask.bounds, offset);
+                shift_matrix(&mut sprite.transformation, offset);
+            }
+            Primitive::PolychromeSprite(sprite) => {
+                shift(&mut sprite.bounds, offset);
+                shift(&mut sprite.content_mask.bounds, offset);
+            }
+            Primitive::Surface(surface) => {
+                shift(&mut surface.bounds, offset);
+                shift(&mut surface.content_mask.bounds, offset);
+            }
         }
     }
 
@@ -463,6 +555,23 @@ impl<'a> Iterator for BatchIterator<'a> {
             }
         }
     }
+}
+
+/// Rewrites a sprite transformation for a sprite whose bounds moved by `-offset`, so it
+/// still maps every point where it did before, then moves it by `-offset` too. Sprite
+/// transforms are absolute in device space (they rotate about a device point), so they
+/// are conjugated by the translation: `T(-offset) * matrix * T(offset)`.
+fn translated_sprite_transform(
+    matrix: TransformationMatrix,
+    offset: Point<ScaledPixels>,
+) -> TransformationMatrix {
+    if matrix == TransformationMatrix::unit() {
+        return matrix;
+    }
+    TransformationMatrix::unit()
+        .translate(point(ScaledPixels(-offset.x.0), ScaledPixels(-offset.y.0)))
+        .compose(matrix)
+        .compose(TransformationMatrix::unit().translate(offset))
 }
 
 #[derive(Debug)]
@@ -945,5 +1054,109 @@ impl PathVertex<Pixels> {
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Radians, Size, px, size};
+
+    fn device_bounds(x: f32, y: f32, w: f32, h: f32) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: point(ScaledPixels(x), ScaledPixels(y)),
+            size: Size {
+                width: ScaledPixels(w),
+                height: ScaledPixels(h),
+            },
+        }
+    }
+
+    fn quad(bounds: Bounds<ScaledPixels>, mask: Bounds<ScaledPixels>) -> Quad {
+        Quad {
+            bounds,
+            content_mask: ContentMask { bounds: mask },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn view_transform_moves_bounds_and_content_mask_together() {
+        let mut scene = Scene::default();
+        scene.set_view_transform(point(ScaledPixels(100.), ScaledPixels(40.)), None);
+        scene.insert_primitive(quad(
+            device_bounds(120., 50., 10., 10.),
+            device_bounds(110., 45., 30., 20.),
+        ));
+        let inserted = scene.quads[0];
+        assert_eq!(inserted.bounds, device_bounds(20., 10., 10., 10.));
+        assert_eq!(
+            inserted.content_mask.bounds,
+            device_bounds(10., 5., 30., 20.)
+        );
+    }
+
+    #[test]
+    fn view_transform_culls_primitives_outside_the_viewport() {
+        let mut scene = Scene::default();
+        let viewport = device_bounds(0., 0., 200., 100.);
+        scene.set_view_transform(point(ScaledPixels(300.), ScaledPixels(0.)), Some(viewport));
+        let everywhere = device_bounds(-10_000., -10_000., 20_000., 20_000.);
+        // Lands at x = -200: off screen.
+        scene.insert_primitive(quad(device_bounds(100., 10., 50., 50.), everywhere));
+        // Lands at x = 50: on screen.
+        scene.insert_primitive(quad(device_bounds(350., 10., 50., 50.), everywhere));
+        assert_eq!(scene.quads.len(), 1);
+        assert_eq!(scene.quads[0].bounds.origin.x, ScaledPixels(50.));
+    }
+
+    #[test]
+    fn replay_does_not_translate_twice() {
+        let offset = point(ScaledPixels(30.), ScaledPixels(20.));
+        let everywhere = device_bounds(-10_000., -10_000., 20_000., 20_000.);
+        let mut previous = Scene::default();
+        previous.set_view_transform(offset, None);
+        previous.push_layer(device_bounds(30., 20., 100., 100.));
+        previous.insert_primitive(quad(device_bounds(40., 30., 5., 5.), everywhere));
+        previous.pop_layer();
+
+        let mut next = Scene::default();
+        next.set_view_transform(offset, None);
+        next.replay(0..previous.len(), &previous);
+        assert_eq!(next.quads[0].bounds, previous.quads[0].bounds);
+        assert_eq!(
+            next.quads[0].bounds.origin,
+            point(ScaledPixels(10.), ScaledPixels(10.))
+        );
+        match &next.paint_operations[0] {
+            PaintOperation::StartLayer(bounds) => {
+                assert_eq!(*bounds, device_bounds(0., 0., 100., 100.))
+            }
+            _ => panic!("expected a layer"),
+        }
+    }
+
+    #[test]
+    fn translated_sprite_transform_moves_rotated_points_by_offset() {
+        let center = point(px(50.), px(80.));
+        let matrix = TransformationMatrix::unit()
+            .translate(point(ScaledPixels(50.), ScaledPixels(80.)))
+            .rotate(Radians(0.7))
+            .scale(size(1.5, 0.5))
+            .translate(point(ScaledPixels(-50.), ScaledPixels(-80.)));
+        let offset = point(ScaledPixels(12.), ScaledPixels(-7.));
+        let moved = translated_sprite_transform(matrix, offset);
+        for p in [center, point(px(0.), px(0.)), point(px(61.), px(99.))] {
+            // The sprite's vertices move by -offset before the shader applies the matrix.
+            let shifted = point(p.x - px(offset.x.0), p.y - px(offset.y.0));
+            let expected = matrix.apply(p);
+            let actual = moved.apply(shifted);
+            assert!((actual.x.0 - (expected.x.0 - offset.x.0)).abs() < 1e-3);
+            assert!((actual.y.0 - (expected.y.0 - offset.y.0)).abs() < 1e-3);
+        }
+        assert_eq!(
+            translated_sprite_transform(TransformationMatrix::unit(), offset),
+            TransformationMatrix::unit()
+        );
     }
 }

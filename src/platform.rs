@@ -1532,9 +1532,14 @@ impl PlatformInputHandler {
             .ok();
     }
 
+    /// Bounds of `range_utf16` in window coordinates (magnification applied), for the OS.
     pub fn bounds_for_range(&mut self, range_utf16: Range<usize>) -> Option<Bounds<Pixels>> {
         self.cx
-            .update(|window, cx| self.handler.bounds_for_range(range_utf16, window, cx))
+            .update(|window, cx| {
+                self.handler
+                    .bounds_for_range(range_utf16, window, cx)
+                    .map(|bounds| window.magnification().content_to_window_bounds(bounds))
+            })
             .ok()
             .flatten()
     }
@@ -1586,9 +1591,10 @@ impl PlatformInputHandler {
     pub fn selected_bounds(&mut self, window: &mut Window, cx: &mut App) -> Option<Bounds<Pixels>> {
         let marked_range = self.handler.marked_text_range(window, cx);
         let selection = self.handler.selected_text_range(true, window, cx)?;
-        Self::compute_ime_candidate_bounds(marked_range, &selection, |range| {
+        let bounds = Self::compute_ime_candidate_bounds(marked_range, &selection, |range| {
             self.handler.bounds_for_range(range, window, cx)
-        })
+        })?;
+        Some(window.magnification().content_to_window_bounds(bounds))
     }
 
     pub fn ime_candidate_bounds(&mut self) -> Option<Bounds<Pixels>> {
@@ -1602,7 +1608,10 @@ impl PlatformInputHandler {
     #[allow(unused)]
     pub fn character_index_for_point(&mut self, point: Point<Pixels>) -> Option<usize> {
         self.cx
-            .update(|window, cx| self.handler.character_index_for_point(point, window, cx))
+            .update(|window, cx| {
+                let point = window.magnification().window_to_content(point);
+                self.handler.character_index_for_point(point, window, cx)
+            })
             .ok()
             .flatten()
     }
@@ -1620,7 +1629,11 @@ impl PlatformInputHandler {
     /// See [`InputHandler::element_bounds`].
     pub fn element_bounds(&mut self) -> Option<Bounds<Pixels>> {
         self.cx
-            .update(|window, cx| self.handler.element_bounds(window, cx))
+            .update(|window, cx| {
+                self.handler
+                    .element_bounds(window, cx)
+                    .map(|bounds| window.magnification().content_to_window_bounds(bounds))
+            })
             .ok()
             .flatten()
     }

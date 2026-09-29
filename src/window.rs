@@ -6,23 +6,24 @@ use crate::Inspector;
 use crate::profiler;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
-    Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
+    AsyncWindowContext, AtlasKey, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds,
+    BoxShadow, Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
-    KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
-    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
-    TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
-    point, prelude::*, px, rems, size, transparent_black,
+    KeystrokeEvent, LayoutId, LineLayoutIndex, MAGNIFIED_PAN_PIXELS_PER_LINE, Magnification,
+    Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent,
+    MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
+    PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
+    Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
+    ScaledPixels, Scene, ScrollDelta, Shadow, SharedString, Size, StrikethroughStyle, Style,
+    SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController,
+    TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration, TextInputStateChange,
+    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
+    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point,
+    prelude::*, px, rems, size, transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -1191,6 +1192,20 @@ pub struct Window {
     modifiers: Modifiers,
     capslock: Capslock,
     scale_factor: f32,
+    /// Visual magnification of everything the window paints; see [`Magnification`].
+    magnification: Magnification,
+    /// Whether a magnification gesture is in progress; see [`Window::set_magnification_live`].
+    magnification_live: bool,
+    /// Factor [`Window::scale_factor`] includes while painting a magnified frame, 1 otherwise.
+    paint_magnification: f32,
+    /// Factor glyphs and SVGs are rasterized at while painting, 1 otherwise. Equal to
+    /// `paint_magnification` except during a live gesture.
+    paint_raster_magnification: f32,
+    /// The last mouse position in window coordinates, before magnification is undone.
+    mouse_window_position: Point<Pixels>,
+    /// Glyph atlas keys first rasterized while magnified, grouped by raster scale bits, so
+    /// the scales a settled window no longer draws at can be evicted.
+    magnified_glyph_keys: FxHashMap<u32, Vec<AtlasKey>>,
     pub(crate) bounds_observers: SubscriberSet<(), AnyObserver>,
     appearance: WindowAppearance,
     pub(crate) appearance_observers: SubscriberSet<(), AnyObserver>,
@@ -2015,6 +2030,12 @@ impl Window {
             modifiers,
             capslock,
             scale_factor,
+            magnification: Magnification::IDENTITY,
+            magnification_live: false,
+            paint_magnification: 1.0,
+            paint_raster_magnification: 1.0,
+            mouse_window_position: mouse_position,
+            magnified_glyph_keys: FxHashMap::default(),
             bounds_observers: SubscriberSet::new(),
             appearance,
             appearance_observers: SubscriberSet::new(),
@@ -2071,6 +2092,19 @@ impl Window {
 pub struct DispatchEventResult {
     pub propagate: bool,
     pub default_prevented: bool,
+}
+
+/// Scales sprite bounds by `stretch`, used to draw a glyph rasterized at a quantized scale
+/// during a live magnification gesture at the frame's real scale.
+#[inline]
+fn stretch_sprite_bounds(bounds: Bounds<ScaledPixels>, stretch: f32) -> Bounds<ScaledPixels> {
+    if stretch == 1.0 {
+        return bounds;
+    }
+    Bounds {
+        origin: bounds.origin.map(|c| ScaledPixels(c.0 * stretch)),
+        size: bounds.size.map(|c| ScaledPixels(c.0 * stretch)),
+    }
 }
 
 /// Indicates which region of the window is visible. Content falling outside of this mask will not be
@@ -2587,7 +2621,13 @@ impl Window {
         self.scale_factor = self.platform_window.scale_factor();
         self.viewport_size = self.platform_window.content_size();
         self.display_id = self.platform_window.display().map(|display| display.id());
-        self.mouse_position = self.platform_window.mouse_position();
+        self.mouse_window_position = self.platform_window.mouse_position();
+        self.magnification = self
+            .magnification
+            .clamped(self.viewport_size, self.scale_factor);
+        self.mouse_position = self
+            .magnification
+            .window_to_content(self.mouse_window_position);
 
         self.refresh();
 
@@ -2779,8 +2819,197 @@ impl Window {
     /// The scale factor of the display associated with the window. For example, it could
     /// return 2.0 for a "retina" display, indicating that each logical pixel should actually
     /// be rendered as two pixels on screen.
+    ///
+    /// While painting a magnified window (see [`Window::set_magnification`]) this includes
+    /// the magnification, so it is always the number of device pixels one logical content
+    /// pixel covers in the frame being painted. Layout and prepaint see the display scale.
     pub fn scale_factor(&self) -> f32 {
-        self.scale_factor
+        self.scale_factor * self.paint_magnification
+    }
+
+    /// The scale glyphs and SVGs are rasterized at in the frame being painted. Equal to
+    /// [`Self::scale_factor`] except while a magnification gesture is live.
+    fn raster_scale_factor(&self) -> f32 {
+        self.scale_factor * self.paint_raster_magnification
+    }
+
+    /// The window's visual magnification. See [`Magnification`].
+    pub fn magnification(&self) -> Magnification {
+        self.magnification
+    }
+
+    /// Magnifies what the window paints without changing layout, like pinch zoom in a
+    /// browser. Text and SVGs are re-rasterized at the magnified scale so they stay crisp;
+    /// input positions are mapped back to content coordinates before dispatch, and scroll
+    /// deltas pan the magnified view until it reaches an edge before reaching the content.
+    ///
+    /// The value is clamped to the viewport; [`Self::magnification`] returns what was applied.
+    pub fn set_magnification(&mut self, magnification: Magnification) {
+        let magnification = magnification.clamped(self.viewport_size, self.scale_factor);
+        if magnification == self.magnification {
+            return;
+        }
+        self.magnification = magnification;
+        self.mouse_position = magnification.window_to_content(self.mouse_window_position);
+        self.refresh();
+    }
+
+    /// Sets the magnification scale while keeping `content_anchor` (a content point, such
+    /// as a [`crate::PinchEvent`] position) where it currently appears in the window.
+    pub fn magnify_about(&mut self, content_anchor: Point<Pixels>, scale: f32) {
+        self.set_magnification(self.magnification.zoomed_about(content_anchor, scale));
+    }
+
+    /// Removes any magnification.
+    pub fn reset_magnification(&mut self) {
+        self.set_magnification(Magnification::IDENTITY);
+    }
+
+    /// Marks a magnification gesture (such as a pinch) as in progress. While live, glyphs
+    /// and SVGs are rasterized at a few quantized scales and drawn slightly stretched, so
+    /// each frame of the gesture does not rasterize every glyph again. Clearing it redraws
+    /// at the exact scale and releases the glyph rasterizations the window no longer uses.
+    pub fn set_magnification_live(&mut self, live: bool) {
+        if self.magnification_live != live {
+            self.magnification_live = live;
+            self.refresh();
+        }
+    }
+
+    /// Whether a magnification gesture is in progress; see [`Self::set_magnification_live`].
+    pub fn is_magnification_live(&self) -> bool {
+        self.magnification_live
+    }
+
+    /// Starts painting with the window's magnification applied.
+    fn begin_magnified_paint(&mut self) {
+        let magnification = self.magnification;
+        if magnification.is_identity() {
+            return;
+        }
+        self.paint_magnification = magnification.scale;
+        self.paint_raster_magnification = magnification.raster_scale(self.magnification_live);
+        let device_viewport =
+            Bounds::new(Point::default(), self.viewport_size).scale(self.scale_factor);
+        self.next_frame.scene.set_view_transform(
+            magnification.device_translation(self.scale_factor),
+            Some(device_viewport),
+        );
+    }
+
+    fn end_magnified_paint(&mut self) {
+        self.paint_magnification = 1.0;
+        self.paint_raster_magnification = 1.0;
+    }
+
+    /// Frees glyph rasterizations made at magnified scales the window no longer paints at.
+    /// Runs only once a gesture settles, so a pinch keeps its few quantized scales cached.
+    fn evict_stale_magnified_glyphs(&mut self) {
+        if self.magnification_live || self.magnified_glyph_keys.is_empty() {
+            return;
+        }
+        let current = (self.scale_factor * self.magnification.scale).to_bits();
+        let sprite_atlas = &self.sprite_atlas;
+        self.magnified_glyph_keys.retain(|scale_bits, keys| {
+            if *scale_bits == current {
+                return true;
+            }
+            for key in keys.drain(..) {
+                sprite_atlas.remove(&key);
+            }
+            false
+        });
+    }
+
+    /// Maps positions in platform input from window to content coordinates and lets
+    /// scrolling pan a magnified view before it reaches the content.
+    fn unmagnify_input(&mut self, event: PlatformInput) -> PlatformInput {
+        match &event {
+            PlatformInput::MouseMove(e) => self.mouse_window_position = e.position,
+            PlatformInput::MouseDown(e) => self.mouse_window_position = e.position,
+            PlatformInput::MouseUp(e) => self.mouse_window_position = e.position,
+            PlatformInput::ScrollWheel(e) => self.mouse_window_position = e.position,
+            PlatformInput::Pinch(e) => self.mouse_window_position = e.position,
+            _ => {}
+        }
+        let m = self.magnification;
+        if m.is_identity() {
+            return event;
+        }
+        let map = |position: Point<Pixels>| m.window_to_content(position);
+        match event {
+            PlatformInput::MouseDown(mut e) => {
+                e.position = map(e.position);
+                PlatformInput::MouseDown(e)
+            }
+            PlatformInput::MouseUp(mut e) => {
+                e.position = map(e.position);
+                PlatformInput::MouseUp(e)
+            }
+            PlatformInput::MouseMove(mut e) => {
+                e.position = map(e.position);
+                PlatformInput::MouseMove(e)
+            }
+            PlatformInput::MousePressure(mut e) => {
+                e.position = map(e.position);
+                PlatformInput::MousePressure(e)
+            }
+            PlatformInput::MouseExited(mut e) => {
+                e.position = map(e.position);
+                PlatformInput::MouseExited(e)
+            }
+            PlatformInput::Pinch(mut e) => {
+                e.position = map(e.position);
+                PlatformInput::Pinch(e)
+            }
+            PlatformInput::Touch(mut e) => {
+                e.position = map(e.position);
+                e.predicted_position = e.predicted_position.map(map);
+                PlatformInput::Touch(e)
+            }
+            PlatformInput::ScrollWheel(mut e) => {
+                e.position = map(e.position);
+                e.delta = self.pan_magnified_view(e.delta);
+                PlatformInput::ScrollWheel(e)
+            }
+            PlatformInput::FileDrop(FileDropEvent::Entered { position, paths }) => {
+                PlatformInput::FileDrop(FileDropEvent::Entered {
+                    position: map(position),
+                    paths,
+                })
+            }
+            PlatformInput::FileDrop(FileDropEvent::Pending { position }) => {
+                PlatformInput::FileDrop(FileDropEvent::Pending {
+                    position: map(position),
+                })
+            }
+            PlatformInput::FileDrop(FileDropEvent::Submit { position }) => {
+                PlatformInput::FileDrop(FileDropEvent::Submit {
+                    position: map(position),
+                })
+            }
+            event => event,
+        }
+    }
+
+    /// Pans the magnified view by a scroll delta and returns the part it could not absorb,
+    /// converted to content pixels, for the content to scroll by.
+    fn pan_magnified_view(&mut self, delta: ScrollDelta) -> ScrollDelta {
+        let scale = self.magnification.scale;
+        let window_delta = match delta {
+            ScrollDelta::Pixels(delta) => delta,
+            ScrollDelta::Lines(lines) => lines.map(|c| px(c * MAGNIFIED_PAN_PIXELS_PER_LINE)),
+        };
+        let (panned, remaining) =
+            self.magnification
+                .panned_by(window_delta, self.viewport_size, self.scale_factor);
+        self.set_magnification(panned);
+        match delta {
+            ScrollDelta::Pixels(_) => ScrollDelta::Pixels(remaining.map(|c| c / scale)),
+            ScrollDelta::Lines(_) => {
+                ScrollDelta::Lines(remaining.map(|c| c.0 / MAGNIFIED_PAN_PIXELS_PER_LINE / scale))
+            }
+        }
     }
 
     /// Overrides the display scale factor for tests.
@@ -3149,6 +3378,7 @@ impl Window {
         self.record_entities_accessed(cx);
         self.reset_cursor_style(cx);
         self.refreshing = false;
+        self.evict_stale_magnified_glyphs();
         self.invalidator.set_phase(DrawPhase::None);
         // Focus listeners may move focus (e.g. a dock forwarding focus to its active
         // panel). `Window::focus` suppresses `refresh` while a draw is in progress, so
@@ -3335,6 +3565,7 @@ impl Window {
 
         // Now actually paint the elements.
         self.invalidator.set_phase(DrawPhase::Paint);
+        self.begin_magnified_paint();
         root_element.paint(self, cx);
 
         #[cfg(any(feature = "inspector", debug_assertions))]
@@ -3352,6 +3583,7 @@ impl Window {
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector_hitbox(cx);
+        self.end_magnified_paint();
 
         // a11y may have been activated/deactivated halfway through the frame
         let a11y_active_start_of_frame = self.a11y.is_active();
@@ -4451,7 +4683,10 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let element_opacity = self.element_opacity();
-        let scale_factor = self.scale_factor();
+        let scale_factor = self.raster_scale_factor();
+        // Draws glyphs rasterized at a quantized scale during a live magnification gesture
+        // at the frame's real scale. Exactly 1.0 otherwise.
+        let stretch = self.scale_factor() / scale_factor;
         let glyph_origin = origin.scale(scale_factor);
 
         let quantized_origin = Point::new(
@@ -4480,17 +4715,14 @@ impl Window {
 
         let raster_bounds = self.text_system().raster_bounds(&params)?;
         if !raster_bounds.is_zero() {
-            let tile = self
-                .sprite_atlas
-                .get_or_insert_with(&params.clone().into(), &mut || {
-                    let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
-                    Ok(Some((size, Cow::Owned(bytes))))
-                })?
-                .expect("Callback above only errors or returns Some");
-            let bounds = Bounds {
-                origin: integer_origin + raster_bounds.origin.map(Into::into),
-                size: tile.bounds.size.map(Into::into),
-            };
+            let tile = self.get_or_rasterize_glyph(&params)?;
+            let bounds = stretch_sprite_bounds(
+                Bounds {
+                    origin: integer_origin + raster_bounds.origin.map(Into::into),
+                    size: tile.bounds.size.map(Into::into),
+                },
+                stretch,
+            );
             let content_mask = self.snapped_content_mask();
 
             if subpixel_rendering {
@@ -4516,6 +4748,28 @@ impl Window {
             }
         }
         Ok(())
+    }
+
+    /// Looks up or rasterizes a glyph, remembering rasterizations made while magnified so
+    /// they can be evicted when the window settles at another scale.
+    fn get_or_rasterize_glyph(&mut self, params: &RenderGlyphParams) -> Result<AtlasTile> {
+        let key: AtlasKey = params.clone().into();
+        let mut rasterized = false;
+        let tile = self
+            .sprite_atlas
+            .get_or_insert_with(&key, &mut || {
+                rasterized = true;
+                let (size, bytes) = self.text_system().rasterize_glyph(params)?;
+                Ok(Some((size, Cow::Owned(bytes))))
+            })?
+            .expect("Callback above only errors or returns Some");
+        if rasterized && self.paint_magnification != 1.0 {
+            self.magnified_glyph_keys
+                .entry(params.scale_factor.to_bits())
+                .or_default()
+                .push(key);
+        }
+        Ok(tile)
     }
 
     fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
@@ -4554,7 +4808,8 @@ impl Window {
     ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
-        let scale_factor = self.scale_factor();
+        let scale_factor = self.raster_scale_factor();
+        let stretch = self.scale_factor() / scale_factor;
         let glyph_origin = origin.scale(scale_factor);
         let integer_origin = glyph_origin.map(|c| ScaledPixels(round_half_toward_zero(c.0)));
         let params = RenderGlyphParams {
@@ -4570,18 +4825,15 @@ impl Window {
 
         let raster_bounds = self.text_system().raster_bounds(&params)?;
         if !raster_bounds.is_zero() {
-            let tile = self
-                .sprite_atlas
-                .get_or_insert_with(&params.clone().into(), &mut || {
-                    let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
-                    Ok(Some((size, Cow::Owned(bytes))))
-                })?
-                .expect("Callback above only errors or returns Some");
+            let tile = self.get_or_rasterize_glyph(&params)?;
 
-            let bounds = Bounds {
-                origin: integer_origin + raster_bounds.origin.map(Into::into),
-                size: tile.bounds.size.map(Into::into),
-            };
+            let bounds = stretch_sprite_bounds(
+                Bounds {
+                    origin: integer_origin + raster_bounds.origin.map(Into::into),
+                    size: tile.bounds.size.map(Into::into),
+                },
+                stretch,
+            );
             let content_mask = self.snapped_content_mask();
             let opacity = self.element_opacity();
 
@@ -4615,12 +4867,18 @@ impl Window {
 
         let element_opacity = self.element_opacity();
         let bounds = self.snap_bounds(bounds);
+        // During a live magnification gesture, rasterize at a quantized scale; the sprite
+        // below is drawn at `bounds`, so the tile is stretched to fit. Exactly 1.0 otherwise.
+        let raster_ratio = self.raster_scale_factor() / self.scale_factor();
 
         let params = RenderSvgParams {
             path,
-            size: bounds.size.map(|pixels| {
-                DevicePixels::from((pixels.0 * SMOOTH_SVG_SCALE_FACTOR).ceil() as i32)
-            }),
+            size:
+                bounds.size.map(|pixels| {
+                    DevicePixels::from(
+                        (pixels.0 * raster_ratio * SMOOTH_SVG_SCALE_FACTOR).ceil() as i32
+                    )
+                }),
         };
 
         let Some(tile) =
@@ -4636,16 +4894,17 @@ impl Window {
             return Ok(());
         };
         let content_mask = self.snapped_content_mask();
+        let tile_scale = SMOOTH_SVG_SCALE_FACTOR * raster_ratio;
         let svg_bounds = Bounds {
             origin: bounds.center()
                 - Point::new(
-                    ScaledPixels(tile.bounds.size.width.0 as f32 / SMOOTH_SVG_SCALE_FACTOR / 2.),
-                    ScaledPixels(tile.bounds.size.height.0 as f32 / SMOOTH_SVG_SCALE_FACTOR / 2.),
+                    ScaledPixels(tile.bounds.size.width.0 as f32 / tile_scale / 2.),
+                    ScaledPixels(tile.bounds.size.height.0 as f32 / tile_scale / 2.),
                 ),
             size: tile
                 .bounds
                 .size
-                .map(|value| ScaledPixels(value.0 as f32 / SMOOTH_SVG_SCALE_FACTOR)),
+                .map(|value| ScaledPixels(value.0 as f32 / tile_scale)),
         };
         let final_bounds = svg_bounds
             .map_origin(|value| ScaledPixels(round_half_toward_zero(value.0)))
@@ -5212,6 +5471,7 @@ impl Window {
         #[cfg(feature = "profiler")]
         self.window_profiler.begin_input(event.kind_name());
         let update_count_before = self.invalidator.update_count();
+        let event = self.unmagnify_input(event);
         // Track input modality for focus-visible styling and hover suppression.
         // Hover is suppressed during keyboard modality so that keyboard navigation
         // doesn't show hover highlights on the item under the mouse cursor.
@@ -6622,7 +6882,8 @@ impl Window {
         match request.action {
             accesskit::Action::Click => {
                 if let Some(bounds) = self.a11y.node_bounds.get(&request.target_node).copied() {
-                    let center = bounds.center();
+                    // Dispatch maps window positions to content; a11y bounds are content.
+                    let center = self.magnification.content_to_window(bounds.center());
                     let mouse_down = PlatformInput::MouseDown(crate::MouseDownEvent {
                         button: MouseButton::Left,
                         position: center,
@@ -7393,6 +7654,7 @@ mod tests {
         StatefulInteractiveElement as _, Styled, TestAppContext, TouchDragEvent, TouchEvent,
         TouchId, TouchPhase, Window, WindowAppearance, WindowOptions, canvas, div, point, px, size,
     };
+    use crate::{Magnification, ScaledPixels, ScrollDelta, ScrollWheelEvent};
 
     struct EmptyView;
 
@@ -8318,5 +8580,177 @@ mod tests {
                 );
             })
             .unwrap();
+    }
+
+    struct MagnifyTarget {
+        downs: Rc<RefCell<Vec<Point<Pixels>>>>,
+        scrolls: Rc<RefCell<Vec<Point<Pixels>>>>,
+        paint_scales: Rc<RefCell<Vec<f32>>>,
+    }
+
+    impl Render for MagnifyTarget {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let downs = self.downs.clone();
+            let scrolls = self.scrolls.clone();
+            let paint_scales = self.paint_scales.clone();
+            div()
+                .size_full()
+                .on_scroll_wheel(move |event, _, _| {
+                    scrolls.borrow_mut().push(event.delta.pixel_delta(px(1.)));
+                })
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(100.))
+                        .top(px(100.))
+                        .w(px(50.))
+                        .h(px(50.))
+                        .bg(crate::red())
+                        .on_mouse_down(MouseButton::Left, move |event, _, _| {
+                            downs.borrow_mut().push(event.position);
+                        }),
+                )
+                .child(
+                    canvas(
+                        |_, _, _| {},
+                        move |_, _, window, _| {
+                            paint_scales.borrow_mut().push(window.scale_factor());
+                        },
+                    )
+                    .size_full(),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn magnification_scales_paint_and_maps_input_back(cx: &mut TestAppContext) {
+        let downs = Rc::new(RefCell::new(Vec::new()));
+        let scrolls = Rc::new(RefCell::new(Vec::new()));
+        let paint_scales = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window({
+            let (downs, scrolls, paint_scales) =
+                (downs.clone(), scrolls.clone(), paint_scales.clone());
+            move |_, _| MagnifyTarget {
+                downs,
+                scrolls,
+                paint_scales,
+            }
+        });
+        let red_quad = |window: &Window| {
+            window
+                .rendered_frame
+                .scene
+                .quads
+                .iter()
+                .find(|quad| quad.background == crate::red().into())
+                .map(|quad| quad.bounds)
+        };
+        let click = |cx: &mut TestAppContext, x: f32, y: f32| {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.dispatch_event(
+                    MouseDownEvent {
+                        button: MouseButton::Left,
+                        position: point(px(x), px(y)),
+                        modifiers: Default::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            })
+            .unwrap();
+        };
+        let scroll = |cx: &mut TestAppContext, dy: f32| {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.dispatch_event(
+                    ScrollWheelEvent {
+                        position: point(px(10.), px(10.)),
+                        delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
+                        ..Default::default()
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+        };
+
+        let (scale_factor, viewport) = cx
+            .update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                (window.scale_factor(), window.viewport_size())
+            })
+            .unwrap();
+        assert_eq!(paint_scales.borrow().last().copied(), Some(scale_factor));
+
+        let magnification = Magnification::new(2., point(px(50.), px(50.)));
+        cx.update_window(window.into(), |_, window, cx| {
+            window.set_magnification(magnification);
+            assert_eq!(window.magnification(), magnification);
+            window.draw(cx).clear(cx);
+            // Outside paint, the scale factor is the display's.
+            assert_eq!(window.scale_factor(), scale_factor);
+            // Content (100, 100) is at window (100, 100): (100 - 50) * 2. The quad is
+            // 50 content px = 100 window px, all in device pixels.
+            let device = |c: f32| ScaledPixels(c * scale_factor);
+            assert_eq!(
+                red_quad(window),
+                Some(Bounds {
+                    origin: point(device(100.), device(100.)),
+                    size: size(device(100.), device(100.)),
+                })
+            );
+        })
+        .unwrap();
+        assert_eq!(
+            paint_scales.borrow().last().copied(),
+            Some(scale_factor * 2.)
+        );
+
+        // Window (150, 150) shows content (125, 125), inside the target.
+        click(cx, 150., 150.);
+        assert_eq!(downs.borrow().as_slice(), [point(px(125.), px(125.))]);
+        // The target now spans window 100..200. Window (60, 60) and (99, 99) show content
+        // (80, 80) and (99.5, 99.5), outside it; window (101, 101) shows (100.5, 100.5).
+        click(cx, 60., 60.);
+        click(cx, 99., 99.);
+        assert_eq!(downs.borrow().len(), 1);
+        click(cx, 101., 101.);
+        assert_eq!(downs.borrow().len(), 2);
+        cx.update_window(window.into(), |_, window, _| {
+            assert_eq!(window.mouse_position(), point(px(100.5), px(100.5)));
+        })
+        .unwrap();
+
+        // Scrolling pans the magnified view first; the content sees nothing left over.
+        scroll(cx, -20.);
+        assert_eq!(scrolls.borrow().last().copied(), Some(Point::default()));
+        let origin_y = cx
+            .update_window(window.into(), |_, window, _| {
+                window.magnification().origin.y
+            })
+            .unwrap();
+        assert_eq!(origin_y, px(60.));
+
+        // Past the bottom edge the rest reaches the content, in content pixels.
+        let max_origin_y = viewport.height / 2.;
+        scroll(cx, -2000.);
+        let absorbed = (max_origin_y - origin_y) * 2.;
+        let expected = (px(-2000.) + absorbed) / 2.;
+        let delta = scrolls.borrow().last().copied().unwrap();
+        assert!(
+            (delta.y - expected).abs() < px(0.01),
+            "{delta:?} vs {expected:?}"
+        );
+        cx.update_window(window.into(), |_, window, cx| {
+            assert_eq!(window.magnification().origin.y, max_origin_y);
+            window.reset_magnification();
+            assert!(window.magnification().is_identity());
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        assert_eq!(paint_scales.borrow().last().copied(), Some(scale_factor));
     }
 }
