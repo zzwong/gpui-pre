@@ -1,3 +1,29 @@
+# gpui-pre (visual-zoom spike for diffz)
+
+This branch is the published [`gpui-pre`](https://crates.io/crates/gpui-pre) 0.3.3
+crate (a snapshot of Zed's `gpui` at `zed@5b055fa`) plus a **spike** of
+browser-style visual magnification ("pinch zoom") for
+[diffz](https://github.com/zzwong/diffz). It is not an accepted patch:
+`diffz/0.3.3` stays the pristine crate, and `git diff v0.3.3-upstream` is the
+full delta carried here.
+
+- `Window::set_magnification` / `magnify_about` / `reset_magnification`
+  enlarge everything a window paints without relayout. Text and SVGs are
+  rasterized at the magnified scale, so they stay crisp.
+- Input positions are mapped back to content coordinates before dispatch;
+  scrolling pans the magnified view to its edge before reaching the content;
+  IME rects are reported to the OS in window coordinates.
+- `Window::set_magnification_live` rasterizes at quarter-octave steps during a
+  gesture and evicts stale glyph rasterizations once it settles.
+
+The transform math is in `src/magnification.rs`; the paint chokepoint is
+`Window::scale_factor` (which includes the magnification while painting) plus
+a device-pixel translation the `Scene` applies on insert.
+
+Licensed under Apache-2.0, as the upstream crate is.
+
+---
+
 # Welcome to GPUI!
 
 GPUI is a hybrid immediate and retained mode, GPU accelerated, UI framework
