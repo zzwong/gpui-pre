@@ -1196,6 +1196,7 @@ pub struct Window {
     magnification: Magnification,
     /// Whether a magnification gesture is in progress; see [`Window::set_magnification_live`].
     magnification_live: bool,
+    magnification_live_raster_exact: bool,
     /// Factor [`Window::scale_factor`] includes while painting a magnified frame, 1 otherwise.
     paint_magnification: f32,
     /// Factor glyphs and SVGs are rasterized at while painting, 1 otherwise. Equal to
@@ -2032,6 +2033,7 @@ impl Window {
             scale_factor,
             magnification: Magnification::IDENTITY,
             magnification_live: false,
+            magnification_live_raster_exact: false,
             paint_magnification: 1.0,
             paint_raster_magnification: 1.0,
             mouse_window_position: mouse_position,
@@ -2881,6 +2883,16 @@ impl Window {
         self.magnification_live
     }
 
+    /// Draws a live gesture at its exact scale without releasing cached glyph sizes.
+    /// Use this when the scale stops changing at an app's zoom limit; disable it
+    /// when the gesture moves away from the limit to resume quantized rasterization.
+    pub fn set_magnification_live_raster_exact(&mut self, exact: bool) {
+        if self.magnification_live_raster_exact != exact {
+            self.magnification_live_raster_exact = exact;
+            self.refresh();
+        }
+    }
+
     /// Starts painting with the window's magnification applied.
     fn begin_magnified_paint(&mut self) {
         let magnification = self.magnification;
@@ -2888,7 +2900,8 @@ impl Window {
             return;
         }
         self.paint_magnification = magnification.scale;
-        self.paint_raster_magnification = magnification.raster_scale(self.magnification_live);
+        self.paint_raster_magnification = magnification
+            .raster_scale(self.magnification_live && !self.magnification_live_raster_exact);
         let device_viewport =
             Bounds::new(Point::default(), self.viewport_size).scale(self.scale_factor);
         self.next_frame.scene.set_view_transform(
@@ -8620,6 +8633,36 @@ mod tests {
                     .size_full(),
                 )
         }
+    }
+
+    #[gpui::test]
+    fn exact_live_raster_preserves_gesture_caches(cx: &mut TestAppContext) {
+        cx.skip_drawing();
+        let handle = cx.add_window(|_, _| EmptyView);
+        handle
+            .update(cx, |_, window, _| {
+                window.set_magnification(Magnification::new(5., Point::default()));
+                window.set_magnification_live(true);
+                window
+                    .magnified_glyph_keys
+                    .insert(2.0_f32.to_bits(), Vec::new());
+                window.set_magnification_live_raster_exact(true);
+                window.begin_magnified_paint();
+                assert_eq!(window.paint_raster_magnification, 5.);
+                window.end_magnified_paint();
+                window.evict_stale_magnified_glyphs();
+                assert!(window.magnified_glyph_keys.contains_key(&2.0_f32.to_bits()));
+
+                window.set_magnification_live_raster_exact(false);
+                window.set_magnification(Magnification::new(4.5, Point::default()));
+                window.begin_magnified_paint();
+                assert!(window.paint_raster_magnification < 4.5);
+                window.end_magnified_paint();
+                window.set_magnification_live(false);
+                window.evict_stale_magnified_glyphs();
+                assert!(!window.magnified_glyph_keys.contains_key(&2.0_f32.to_bits()));
+            })
+            .unwrap();
     }
 
     #[gpui::test]
