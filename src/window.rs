@@ -1178,6 +1178,7 @@ pub struct Window {
     pub(crate) image_cache_stack: Vec<AnyImageCache>,
     pub(crate) rendered_frame: Frame,
     pub(crate) next_frame: Frame,
+    reclaim_scene_capacity_requested: bool,
     next_hitbox_id: HitboxId,
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
@@ -2017,6 +2018,7 @@ impl Window {
             focused_text_input_active: false,
             rendered_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
             next_frame: Frame::new(DispatchTree::new(cx.keymap.clone(), cx.actions.clone())),
+            reclaim_scene_capacity_requested: false,
             next_frame_callbacks,
             next_hitbox_id: HitboxId(0),
             next_tooltip_id: TooltipId::default(),
@@ -2217,6 +2219,16 @@ impl Window {
             self.refreshing = true;
             self.invalidator.set_dirty(true);
         }
+    }
+
+    /// Requests a one-time release of unused storage held by both frame scenes.
+    ///
+    /// The scene contents stay available for presentation and cached paint replay. Reclamation
+    /// runs at the next frame boundary; if called while drawing, it schedules the following frame.
+    /// Call this after replacing content that produced a much larger scene.
+    pub fn reclaim_scene_capacity(&mut self) {
+        self.reclaim_scene_capacity_requested = true;
+        self.refresh();
     }
 
     /// Close this window.
@@ -3262,6 +3274,8 @@ impl Window {
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
+        let reclaim_scene_capacity = mem::take(&mut self.reclaim_scene_capacity_requested);
+
         // Drain every draw in profiler builds so a previous frame's
         // first-invalidation timestamp can't be attributed to this one.
         #[cfg(feature = "profiler")]
@@ -3350,6 +3364,10 @@ impl Window {
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
         self.next_frame.clear();
+        if reclaim_scene_capacity {
+            self.rendered_frame.scene.shrink_to_fit();
+            self.next_frame.scene.shrink_to_fit();
+        }
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;
         let mut focus_before_listeners = self.focus;
@@ -3396,8 +3414,9 @@ impl Window {
         // Focus listeners may move focus (e.g. a dock forwarding focus to its active
         // panel). `Window::focus` suppresses `refresh` while a draw is in progress, so
         // schedule another frame here to render the new focus state and dispatch the
-        // resulting focus events.
-        if self.focus != focus_before_listeners {
+        // resulting focus events. A scene-capacity request made during drawing also needs
+        // another frame because it was not captured at the start of this draw.
+        if self.focus != focus_before_listeners || self.reclaim_scene_capacity_requested {
             self.refresh();
         }
         self.needs_present.set(true);
@@ -7667,7 +7686,7 @@ mod tests {
         StatefulInteractiveElement as _, Styled, TestAppContext, TouchDragEvent, TouchEvent,
         TouchId, TouchPhase, Window, WindowAppearance, WindowOptions, canvas, div, point, px, size,
     };
-    use crate::{Magnification, ScaledPixels, ScrollDelta, ScrollWheelEvent};
+    use crate::{Magnification, ScaledPixels, Scene, ScrollDelta, ScrollWheelEvent};
 
     struct EmptyView;
 
@@ -7675,6 +7694,108 @@ mod tests {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             div()
         }
+    }
+
+    struct SceneCapacityView {
+        quad_count: Rc<Cell<usize>>,
+        reclaim_during_paint: Rc<Cell<bool>>,
+    }
+
+    impl Render for SceneCapacityView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let quad_count = self.quad_count.clone();
+            let reclaim_during_paint = self.reclaim_during_paint.clone();
+            div().size_full().child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, _| {
+                        if reclaim_during_paint.replace(false) {
+                            window.reclaim_scene_capacity();
+                        }
+
+                        for index in 0..quad_count.get() {
+                            let origin = point(
+                                bounds.origin.x + px((index % 20) as f32 * 8.),
+                                bounds.origin.y + px((index / 20) as f32 * 8.),
+                            );
+                            window.paint_quad(crate::fill(
+                                Bounds {
+                                    origin,
+                                    size: size(px(5.), px(5.)),
+                                },
+                                crate::rgb(0x336699),
+                            ));
+                        }
+                    },
+                )
+                .size_full(),
+            )
+        }
+    }
+
+    fn reserve_window_scene_capacity(window: &mut Window, capacity: usize) {
+        fn reserve_vec<T>(vec: &mut Vec<T>, capacity: usize) {
+            vec.reserve(capacity.saturating_sub(vec.len()));
+        }
+
+        reserve_vec(&mut window.rendered_frame.scene.quads, capacity);
+        reserve_vec(&mut window.rendered_frame.scene.paint_operations, capacity);
+        reserve_vec(&mut window.next_frame.scene.quads, capacity);
+        reserve_vec(&mut window.next_frame.scene.paint_operations, capacity);
+    }
+
+    fn window_scene_capacities(window: &Window) -> [[usize; 2]; 2] {
+        [
+            [
+                window.rendered_frame.scene.quads.capacity(),
+                window.rendered_frame.scene.paint_operations.capacity(),
+            ],
+            [
+                window.next_frame.scene.quads.capacity(),
+                window.next_frame.scene.paint_operations.capacity(),
+            ],
+        ]
+    }
+
+    fn sorted_scene_vector_capacities(window: &Window) -> [[usize; 2]; 2] {
+        let capacities = window_scene_capacities(window);
+        let mut sorted = [
+            [capacities[0][0], capacities[1][0]],
+            [capacities[0][1], capacities[1][1]],
+        ];
+        for vector_capacities in &mut sorted {
+            vector_capacities.sort_unstable();
+        }
+        sorted
+    }
+
+    fn assert_both_scene_capacities_shrank(before: [[usize; 2]; 2], after: [[usize; 2]; 2]) {
+        for vector in 0..2 {
+            let smallest_reserved = before[0][vector].min(before[1][vector]);
+            for frame in 0..2 {
+                assert!(
+                    after[frame][vector] < smallest_reserved,
+                    "frame {frame} scene vector {vector} retained its reserved capacity"
+                );
+            }
+        }
+    }
+
+    fn quad_signatures(scene: &Scene) -> Vec<(Bounds<ScaledPixels>, crate::Background)> {
+        scene
+            .quads
+            .iter()
+            .map(|quad| (quad.bounds, quad.background))
+            .collect()
+    }
+
+    fn replay_rendered_scene(
+        window: &mut Window,
+    ) -> Vec<(Bounds<ScaledPixels>, crate::Background)> {
+        let mut end = super::PaintIndex::default();
+        end.scene_index = window.rendered_frame.scene.len();
+        window.reuse_paint(super::PaintIndex::default()..end);
+        quad_signatures(&window.next_frame.scene)
     }
 
     struct OpensWindowOnPaint {
@@ -7818,6 +7939,211 @@ mod tests {
         assert!(
             test_window.frame_wake_count() > baseline || callback_ran.get(),
             "a frame request with pending next-frame callbacks must either run them or re-arm the frame source"
+        );
+    }
+
+    #[gpui::test]
+    fn reclaim_scene_capacity_coalesces_reclaims_both_frames_and_preserves_replay(
+        cx: &mut TestAppContext,
+    ) {
+        const LARGE_SCENE: usize = 96;
+        const RESERVED_CAPACITY: usize = 2048;
+
+        let quad_count = Rc::new(Cell::new(LARGE_SCENE));
+        let reclaim_during_paint = Rc::new(Cell::new(false));
+        let handle = cx.add_window({
+            let quad_count = quad_count.clone();
+            let reclaim_during_paint = reclaim_during_paint.clone();
+            move |_, _| SceneCapacityView {
+                quad_count,
+                reclaim_during_paint,
+            }
+        });
+        let window = AnyWindowHandle::from(handle);
+        let test_window = cx.test_window(window);
+        cx.update_window(window, |_, window, _| window.active.set(true))
+            .unwrap();
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+
+        let initial_scene = cx
+            .update_window(window, |_, window, _| {
+                quad_signatures(&window.rendered_frame.scene)
+            })
+            .unwrap();
+        assert_eq!(initial_scene.len(), LARGE_SCENE);
+
+        let capacities_before = cx
+            .update_window(window, |_, window, _| {
+                reserve_window_scene_capacity(window, RESERVED_CAPACITY);
+                window_scene_capacities(window)
+            })
+            .unwrap();
+        assert!(
+            capacities_before
+                .iter()
+                .flatten()
+                .all(|capacity| { *capacity >= RESERVED_CAPACITY })
+        );
+
+        let wakes_before = test_window.frame_wake_count();
+        cx.update_window(window, {
+            let quad_count = quad_count.clone();
+            move |_, window, _| {
+                quad_count.set(1);
+                window.reclaim_scene_capacity();
+                window.reclaim_scene_capacity();
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            test_window.frame_wake_count(),
+            wakes_before + 1,
+            "multiple capacity requests before a frame should coalesce into one wake"
+        );
+
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        assert_eq!(
+            test_window.frame_wake_count(),
+            wakes_before + 1,
+            "an outside-draw request should be served without a follow-up"
+        );
+        let (capacities_after, active_scene) = cx
+            .update_window(window, |_, window, _| {
+                (
+                    window_scene_capacities(window),
+                    quad_signatures(&window.rendered_frame.scene),
+                )
+            })
+            .unwrap();
+        assert_eq!(active_scene.len(), 1);
+        assert_both_scene_capacities_shrank(capacities_before, capacities_after);
+
+        let replayed_scene = cx
+            .update_window(window, |_, window, _| {
+                let replayed = replay_rendered_scene(window);
+                window.next_frame.scene.clear();
+                replayed
+            })
+            .unwrap();
+        assert_eq!(
+            replayed_scene, active_scene,
+            "reclamation must keep the active primitives available for cached paint replay"
+        );
+
+        let settled_wakes = test_window.frame_wake_count();
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        assert_eq!(test_window.frame_wake_count(), settled_wakes);
+
+        // A normal redraw must keep the large allocations until another explicit request.
+        let capacities_before_normal_frame = cx
+            .update_window(window, |_, window, _| {
+                reserve_window_scene_capacity(window, RESERVED_CAPACITY);
+                window.refresh();
+                sorted_scene_vector_capacities(window)
+            })
+            .unwrap();
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        let capacities_after_normal_frame = cx
+            .update_window(window, |_, window, _| {
+                sorted_scene_vector_capacities(window)
+            })
+            .unwrap();
+        assert_eq!(
+            capacities_after_normal_frame, capacities_before_normal_frame,
+            "ordinary frames should not shrink scene storage"
+        );
+    }
+
+    #[gpui::test]
+    fn reclaim_scene_capacity_requested_during_paint_schedules_one_follow_up(
+        cx: &mut TestAppContext,
+    ) {
+        const RESERVED_CAPACITY: usize = 2048;
+
+        let reclaim_during_paint = Rc::new(Cell::new(false));
+        let handle = cx.add_window({
+            let reclaim_during_paint = reclaim_during_paint.clone();
+            move |_, _| SceneCapacityView {
+                quad_count: Rc::new(Cell::new(1)),
+                reclaim_during_paint,
+            }
+        });
+        let window = AnyWindowHandle::from(handle);
+        let test_window = cx.test_window(window);
+        cx.update_window(window, |_, window, _| window.active.set(true))
+            .unwrap();
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+
+        let wakes_before = test_window.frame_wake_count();
+        let test_window_in_update = test_window.clone();
+        let (wakes_after_first_draw, wakes_after_follow_up, capacities_after_follow_up) = cx
+            .update_window(window, {
+                let reclaim_during_paint = reclaim_during_paint.clone();
+                let test_window = test_window_in_update;
+                move |_, window, cx| {
+                    reserve_window_scene_capacity(window, RESERVED_CAPACITY);
+                    let capacities_before = sorted_scene_vector_capacities(window);
+                    let raw_capacities_before = window_scene_capacities(window);
+
+                    // Keep both manual draws inside this app update: its effect flush would
+                    // otherwise consume the paint-time request before the test can inspect it.
+                    reclaim_during_paint.set(true);
+                    window.refresh();
+                    window.draw(cx).clear(cx);
+
+                    assert!(window.reclaim_scene_capacity_requested);
+                    assert!(window.invalidator.is_dirty());
+                    assert_eq!(
+                        sorted_scene_vector_capacities(window),
+                        capacities_before,
+                        "the request made during paint must wait for the next frame boundary"
+                    );
+                    assert_eq!(test_window.frame_wake_count(), wakes_before + 2);
+                    let wakes_after_first_draw = test_window.frame_wake_count();
+
+                    window.draw(cx).clear(cx);
+                    assert!(!window.reclaim_scene_capacity_requested);
+                    assert!(!window.invalidator.is_dirty());
+                    let capacities_after_follow_up = window_scene_capacities(window);
+                    assert_both_scene_capacities_shrank(
+                        raw_capacities_before,
+                        capacities_after_follow_up,
+                    );
+                    assert_eq!(
+                        test_window.frame_wake_count(),
+                        wakes_after_first_draw,
+                        "the reclamation frame should not schedule another frame"
+                    );
+
+                    (
+                        wakes_after_first_draw,
+                        test_window.frame_wake_count(),
+                        capacities_after_follow_up,
+                    )
+                }
+            })
+            .unwrap();
+
+        assert_eq!(wakes_after_first_draw, wakes_before + 2);
+        assert_eq!(wakes_after_follow_up, wakes_after_first_draw);
+        let (pending_request, dirty, capacities_after_flush) = cx
+            .update_window(window, |_, window, _| {
+                (
+                    window.reclaim_scene_capacity_requested,
+                    window.invalidator.is_dirty(),
+                    window_scene_capacities(window),
+                )
+            })
+            .unwrap();
+        assert!(!pending_request);
+        assert!(!dirty);
+        assert_eq!(capacities_after_flush, capacities_after_follow_up);
+
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        assert_eq!(
+            test_window.frame_wake_count(),
+            wakes_after_follow_up,
+            "the follow-up reclamation should return the render loop to idle"
         );
     }
 

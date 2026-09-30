@@ -76,6 +76,21 @@ impl Scene {
         self.view_cull_bounds = None;
     }
 
+    /// Releases unused storage without changing the primitives or paint operations.
+    pub(crate) fn shrink_to_fit(&mut self) {
+        self.paint_operations.shrink_to_fit();
+        self.primitive_bounds.shrink_to_fit();
+        self.layer_stack.shrink_to_fit();
+        self.paths.shrink_to_fit();
+        self.shadows.shrink_to_fit();
+        self.quads.shrink_to_fit();
+        self.underlines.shrink_to_fit();
+        self.monochrome_sprites.shrink_to_fit();
+        self.subpixel_sprites.shrink_to_fit();
+        self.polychrome_sprites.shrink_to_fit();
+        self.surfaces.shrink_to_fit();
+    }
+
     /// Sets the device-space view transform applied by [`Self::insert_primitive`] and
     /// [`Self::push_layer`]: primitives are moved by `-translation` and, if `cull_bounds`
     /// is set, dropped when they fall entirely outside it. Primitives replayed from a
@@ -1134,6 +1149,88 @@ mod tests {
             }
             _ => panic!("expected a layer"),
         }
+    }
+
+    #[test]
+    fn shrink_to_fit_preserves_scene_contents_and_replay() {
+        let mut previous = Scene::default();
+        let everywhere = device_bounds(-10_000., -10_000., 20_000., 20_000.);
+        let expected_bounds: Vec<_> = (0..96)
+            .map(|index| device_bounds(index as f32 * 12., 0., 5., 5.))
+            .collect();
+        for bounds in &expected_bounds {
+            previous.insert_primitive(quad(*bounds, everywhere));
+        }
+
+        // Make the retained capacity explicit so the assertions do not depend on Vec growth
+        // heuristics for the host allocator.
+        previous.paint_operations.reserve(2048);
+        previous.layer_stack.reserve(2048);
+        previous.paths.reserve(2048);
+        previous.shadows.reserve(2048);
+        previous.quads.reserve(2048);
+        previous.underlines.reserve(2048);
+        previous.monochrome_sprites.reserve(2048);
+        previous.subpixel_sprites.reserve(2048);
+        previous.polychrome_sprites.reserve(2048);
+        previous.surfaces.reserve(2048);
+        let capacities_before = [
+            previous.paint_operations.capacity(),
+            previous.layer_stack.capacity(),
+            previous.paths.capacity(),
+            previous.shadows.capacity(),
+            previous.quads.capacity(),
+            previous.underlines.capacity(),
+            previous.monochrome_sprites.capacity(),
+            previous.subpixel_sprites.capacity(),
+            previous.polychrome_sprites.capacity(),
+            previous.surfaces.capacity(),
+        ];
+
+        previous.shrink_to_fit();
+
+        let capacities_after = [
+            previous.paint_operations.capacity(),
+            previous.layer_stack.capacity(),
+            previous.paths.capacity(),
+            previous.shadows.capacity(),
+            previous.quads.capacity(),
+            previous.underlines.capacity(),
+            previous.monochrome_sprites.capacity(),
+            previous.subpixel_sprites.capacity(),
+            previous.polychrome_sprites.capacity(),
+            previous.surfaces.capacity(),
+        ];
+        assert!(
+            capacities_after
+                .iter()
+                .zip(capacities_before)
+                .all(|(after, before)| *after <= before),
+            "scene vectors should not grow during capacity reclamation"
+        );
+        assert!(previous.paint_operations.capacity() < capacities_before[0]);
+        assert!(previous.quads.capacity() < capacities_before[4]);
+        for index in [1, 2, 3, 5, 6, 7, 8, 9] {
+            assert_eq!(capacities_after[index], 0);
+        }
+        assert_eq!(
+            previous
+                .quads
+                .iter()
+                .map(|quad| quad.bounds)
+                .collect::<Vec<_>>(),
+            expected_bounds
+        );
+
+        let mut next = Scene::default();
+        next.replay(0..previous.len(), &previous);
+        assert_eq!(
+            next.quads
+                .iter()
+                .map(|quad| quad.bounds)
+                .collect::<Vec<_>>(),
+            expected_bounds
+        );
     }
 
     #[test]

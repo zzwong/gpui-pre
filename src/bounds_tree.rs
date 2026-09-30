@@ -113,6 +113,16 @@ where
         self.search_stack.clear();
     }
 
+    /// Releases unused capacity while keeping the indexed bounds intact.
+    pub fn shrink_to_fit(&mut self) {
+        // `search_stack` holds raw pointers into `nodes`; clear it before nodes can move.
+        self.search_stack.clear();
+        self.insert_path.clear();
+        self.nodes.shrink_to_fit();
+        self.insert_path.shrink_to_fit();
+        self.search_stack.shrink_to_fit();
+    }
+
     /// Inserts bounds into the tree and returns its assigned ordering.
     ///
     /// The ordering is one greater than the maximum ordering of any
@@ -432,6 +442,51 @@ mod tests {
         assert_eq!(tree.insert(bounds4), 1); // bounds4 does not overlap with bounds1, bounds2, or bounds3
         assert_eq!(tree.insert(bounds5), 1); // bounds5 does not overlap with any other bounds
         assert_eq!(tree.insert(bounds6), 2); // bounds6 overlaps with bounds4, so it should have a different order
+    }
+
+    #[test]
+    fn shrink_to_fit_preserves_bounds_and_clears_pointer_scratch() {
+        let mut tree = BoundsTree::<f32>::default();
+        for index in 0..96 {
+            let x = index as f32 * 20.0;
+            tree.insert(Bounds {
+                origin: Point { x, y: 0.0 },
+                size: Size {
+                    width: 10.0,
+                    height: 10.0,
+                },
+            });
+        }
+
+        // Model retained scratch capacity, including a search pointer that must not survive
+        // a possible reallocation of `nodes`.
+        tree.nodes.reserve(2048);
+        tree.insert_path.reserve(256);
+        tree.search_stack.reserve(256);
+        tree.insert_path.push(0);
+        tree.search_stack.push(NonNull::from(&tree.nodes[0]));
+        let nodes_len = tree.nodes.len();
+        let nodes_capacity = tree.nodes.capacity();
+        assert!(nodes_capacity > nodes_len);
+
+        tree.shrink_to_fit();
+
+        assert_eq!(tree.nodes.len(), nodes_len);
+        assert!(tree.nodes.capacity() < nodes_capacity);
+        assert!(tree.insert_path.is_empty());
+        assert!(tree.search_stack.is_empty());
+        assert_eq!(tree.insert_path.capacity(), 0);
+        assert_eq!(tree.search_stack.capacity(), 0);
+        assert_eq!(
+            tree.insert(Bounds {
+                origin: Point { x: 0.0, y: 0.0 },
+                size: Size {
+                    width: 10.0,
+                    height: 10.0,
+                },
+            }),
+            2
+        );
     }
 
     #[test]
