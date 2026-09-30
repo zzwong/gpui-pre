@@ -2840,6 +2840,23 @@ impl Window {
         self.magnification
     }
 
+    /// The part of the content currently visible through the window viewport.
+    /// Overlay placement uses these bounds without changing the document layout.
+    pub fn visible_content_bounds(&self) -> Bounds<Pixels> {
+        self.magnification.visible_content(self.viewport_size())
+    }
+
+    pub(crate) fn accessibility_bounds(&self, bounds: Bounds<Pixels>) -> accesskit::Rect {
+        let bounds = self.magnification.content_to_window_bounds(bounds);
+        let scale = self.scale_factor;
+        accesskit::Rect {
+            x0: (bounds.left().0 * scale) as f64,
+            y0: (bounds.top().0 * scale) as f64,
+            x1: (bounds.right().0 * scale) as f64,
+            y1: (bounds.bottom().0 * scale) as f64,
+        }
+    }
+
     /// Magnifies what the window paints without changing layout, like pinch zoom in a
     /// browser. Text and SVGs are re-rasterized at the magnified scale so they stay crisp;
     /// input positions are mapped back to content coordinates before dispatch, and scroll
@@ -3644,31 +3661,28 @@ impl Window {
 
             let mut tooltip_bounds =
                 Bounds::new(mouse_position + point(px(1.), px(1.)), tooltip_size);
-            let window_bounds = Bounds {
-                origin: Point::default(),
-                size: self.viewport_size(),
-            };
+            let window_bounds = self.visible_content_bounds();
 
             if tooltip_bounds.right() > window_bounds.right() {
                 let new_x = mouse_position.x - tooltip_bounds.size.width - px(1.);
-                if new_x >= Pixels::ZERO {
+                if new_x >= window_bounds.left() {
                     tooltip_bounds.origin.x = new_x;
                 } else {
                     tooltip_bounds.origin.x = cmp::max(
-                        Pixels::ZERO,
-                        tooltip_bounds.origin.x - tooltip_bounds.right() - window_bounds.right(),
+                        window_bounds.left(),
+                        window_bounds.right() - tooltip_bounds.size.width,
                     );
                 }
             }
 
             if tooltip_bounds.bottom() > window_bounds.bottom() {
                 let new_y = mouse_position.y - tooltip_bounds.size.height - px(1.);
-                if new_y >= Pixels::ZERO {
+                if new_y >= window_bounds.top() {
                     tooltip_bounds.origin.y = new_y;
                 } else {
                     tooltip_bounds.origin.y = cmp::max(
-                        Pixels::ZERO,
-                        tooltip_bounds.origin.y - tooltip_bounds.bottom() - window_bounds.bottom(),
+                        window_bounds.top(),
+                        window_bounds.bottom() - tooltip_bounds.size.height,
                     );
                 }
             }
@@ -8633,6 +8647,36 @@ mod tests {
                     .size_full(),
                 )
         }
+    }
+
+    #[gpui::test]
+    fn magnification_maps_accessibility_and_overlay_bounds(cx: &mut TestAppContext) {
+        cx.skip_drawing();
+        let handle = cx.open_window(size(px(800.), px(600.)), |_, _| EmptyView);
+        handle
+            .update(cx, |_, window, _| {
+                window.scale_factor = 2.;
+                let bounds = Bounds::new(point(px(150.), px(100.)), size(px(20.), px(10.)));
+                assert_eq!(
+                    window.accessibility_bounds(bounds),
+                    accesskit::Rect::new(300., 200., 340., 220.)
+                );
+                window.set_magnification(Magnification::new(2., point(px(100.), px(50.))));
+                assert_eq!(
+                    window.accessibility_bounds(bounds),
+                    accesskit::Rect::new(200., 200., 280., 240.)
+                );
+                assert_eq!(
+                    window.visible_content_bounds(),
+                    Bounds::new(point(px(100.), px(50.)), size(px(400.), px(300.)))
+                );
+                window.reset_magnification();
+                assert_eq!(
+                    window.visible_content_bounds(),
+                    Bounds::new(Point::default(), size(px(800.), px(600.)))
+                );
+            })
+            .unwrap();
     }
 
     #[gpui::test]
