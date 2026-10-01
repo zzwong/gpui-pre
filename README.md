@@ -1,26 +1,10 @@
-# gpui-pre (visual-zoom spike for diffz)
+# gpui-pre fork maintained for diffz
 
-This branch is the published [`gpui-pre`](https://crates.io/crates/gpui-pre) 0.3.3
-crate (a snapshot of Zed's `gpui` at `zed@5b055fa`) plus a **spike** of
-browser-style visual magnification ("pinch zoom") for
-[diffz](https://github.com/zzwong/diffz). It is not an accepted patch:
-`diffz/0.3.3` stays the pristine crate, and `git diff v0.3.3-upstream` is the
-full delta carried here.
+[`diffz/main`](https://github.com/zzwong/gpui-pre/tree/diffz/main) is the single integration branch. It currently carries the patched published GPUI 0.3.3 snapshot used by diffz. Visual magnification is an experimental spike and remains off by default in the diffz application. Proposed upgrades and patches live on temporary PR branches and join [`diffz/main`](https://github.com/zzwong/gpui-pre/tree/diffz/main) only when accepted.
 
-- `Window::set_magnification` / `magnify_about` / `reset_magnification`
-  enlarge everything a window paints without relayout. Text and SVGs are
-  rasterized at the magnified scale, so they stay crisp.
-- Input positions are mapped back to content coordinates before dispatch;
-  scrolling pans the magnified view to its edge before reaching the content;
-  IME rects are reported to the OS in window coordinates.
-- `Window::set_magnification_live` rasterizes at quarter-octave steps during a
-  gesture and evicts stale glyph rasterizations once it settles.
+Historical 0.3.3 commits are preserved by annotated tags: [archive/upstream-baseline](https://github.com/zzwong/gpui-pre/tree/archive/0.3.3-upstream-baseline), [archive/visual-zoom](https://github.com/zzwong/gpui-pre/tree/archive/0.3.3-visual-zoom), [archive/live-pinch-exact-raster](https://github.com/zzwong/gpui-pre/tree/archive/0.3.3-live-pinch-exact-raster), [archive/magnification-polish](https://github.com/zzwong/gpui-pre/tree/archive/0.3.3-magnification-polish). Pin dependency commits by SHA (`rev`), not moving branch names, to keep builds reproducible.
 
-The transform math is in `src/magnification.rs`; the paint chokepoint is
-`Window::scale_factor` (which includes the magnification while painting) plus
-a device-pixel translation the `Scene` applies on insert.
-
-Licensed under Apache-2.0, as the upstream crate is.
+Licensed under Apache-2.0, as is the upstream crate.
 
 ---
 
