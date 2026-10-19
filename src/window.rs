@@ -6,23 +6,22 @@ use crate::Inspector;
 use crate::profiler;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AtlasKey, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds,
-    BoxShadow, Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
+    AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
+    Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
-    KeystrokeEvent, LayoutId, LineLayoutIndex, MAGNIFIED_PAN_PIXELS_PER_LINE, Magnification,
-    Modifiers, ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent,
-    MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
-    PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
-    Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
-    ScaledPixels, Scene, ScrollDelta, Shadow, SharedString, Size, StrikethroughStyle, Style,
-    SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController,
-    TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration, TextInputStateChange,
-    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
-    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
+    Hsla, InputHandler, InputPreference, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
+    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
+    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
+    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
+    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
+    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
+    TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
+    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
     WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
 };
 
@@ -30,14 +29,16 @@ use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecogni
 use crate::interactive::TouchEvent;
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
-#[cfg(target_os = "macos")]
-use core_video::pixel_buffer::CVPixelBuffer;
 use derive_more::{Deref, DerefMut};
 use futures::channel::oneshot;
 use gpui_util::post_inc;
 use gpui_util::{ResultExt, measure};
 use itertools::FoldWhile::{Continue, Done};
 use itertools::Itertools;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use objc2_core_foundation::CFRetained;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use objc2_core_video::CVPixelBuffer;
 use parking_lot::RwLock;
 use raw_window_handle::{HandleError, HasDisplayHandle, HasWindowHandle};
 use refineable::Refineable;
@@ -141,6 +142,15 @@ struct WindowInvalidatorInner {
 struct FrameDirtyAccumulator {
     dirty_at: Option<Instant>,
     invalidations: u64,
+}
+
+/// Why GPUI capped a window's frame rate.
+#[derive(Clone, Copy)]
+enum FrameRateLimit {
+    /// The window isn't focused.
+    Inactive,
+    /// The system is under thermal pressure.
+    Thermal,
 }
 
 #[derive(Clone)]
@@ -962,11 +972,59 @@ pub(crate) struct TooltipRequest {
     tooltip: AnyTooltip,
 }
 
+/// The ids of the elements being drawn, root first, with the hash of every
+/// prefix alongside: a [`GlobalElementId`] for the current element is then
+/// the ids cloned out and the hash on top of the stack, without walking the
+/// path — the ids of every ancestor, string names byte by byte — for each
+/// element on every frame.
+#[derive(Clone, Default)]
+pub(crate) struct ElementIdStack {
+    ids: SmallVec<[ElementId; 32]>,
+    hashes: SmallVec<[u64; 32]>,
+}
+
+impl ElementIdStack {
+    pub(crate) fn push(&mut self, id: ElementId) {
+        self.hashes.push(crate::extend_path_hash(self.hash(), &id));
+        self.ids.push(id);
+    }
+
+    pub(crate) fn pop(&mut self) -> Option<ElementId> {
+        self.hashes.pop();
+        self.ids.pop()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.ids.clear();
+        self.hashes.clear();
+    }
+
+    /// The hash of the whole path on the stack.
+    fn hash(&self) -> u64 {
+        self.hashes
+            .last()
+            .copied()
+            .unwrap_or(crate::EMPTY_PATH_HASH)
+    }
+
+    pub(crate) fn global_id(&self) -> GlobalElementId {
+        GlobalElementId::with_hash(&self.ids, self.hash())
+    }
+}
+
+impl std::ops::Deref for ElementIdStack {
+    type Target = [ElementId];
+
+    fn deref(&self) -> &Self::Target {
+        &self.ids
+    }
+}
+
 pub(crate) struct DeferredDraw {
     current_view: EntityId,
     priority: usize,
     parent_node: DispatchNodeId,
-    element_id_stack: SmallVec<[ElementId; 32]>,
+    element_id_stack: ElementIdStack,
     text_style_stack: Vec<TextStyleRefinement>,
     content_mask: Option<ContentMask<Pixels>>,
     rem_size: Pixels,
@@ -1160,7 +1218,8 @@ pub struct Window {
     pub(crate) invalidator: WindowInvalidator,
     pub(crate) removed: bool,
     pub(crate) platform_window: Box<dyn PlatformWindow>,
-    display_id: Option<DisplayId>,
+    pub(crate) display_id: Option<DisplayId>,
+    pub(crate) display_observers: SubscriberSet<(), AnyObserver>,
     is_resizable: bool,
     is_minimizable: bool,
     sprite_atlas: Arc<dyn PlatformAtlas>,
@@ -1175,7 +1234,7 @@ pub struct Window {
     pub(crate) viewport_size: Size<Pixels>,
     layout_engine: Option<TaffyLayoutEngine>,
     pub(crate) root: Option<AnyView>,
-    pub(crate) element_id_stack: SmallVec<[ElementId; 32]>,
+    pub(crate) element_id_stack: ElementIdStack,
     pub(crate) text_style_stack: Vec<TextStyleRefinement>,
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
@@ -1204,21 +1263,6 @@ pub struct Window {
     modifiers: Modifiers,
     capslock: Capslock,
     scale_factor: f32,
-    /// Visual magnification of everything the window paints; see [`Magnification`].
-    magnification: Magnification,
-    /// Whether a magnification gesture is in progress; see [`Window::set_magnification_live`].
-    magnification_live: bool,
-    magnification_live_raster_exact: bool,
-    /// Factor [`Window::scale_factor`] includes while painting a magnified frame, 1 otherwise.
-    paint_magnification: f32,
-    /// Factor glyphs and SVGs are rasterized at while painting, 1 otherwise. Equal to
-    /// `paint_magnification` except during a live gesture.
-    paint_raster_magnification: f32,
-    /// The last mouse position in window coordinates, before magnification is undone.
-    mouse_window_position: Point<Pixels>,
-    /// Glyph atlas keys first rasterized while magnified, grouped by raster scale bits, so
-    /// the scales a settled window no longer draws at can be evicted.
-    magnified_glyph_keys: FxHashMap<u32, Vec<AtlasKey>>,
     pub(crate) bounds_observers: SubscriberSet<(), AnyObserver>,
     appearance: WindowAppearance,
     pub(crate) appearance_observers: SubscriberSet<(), AnyObserver>,
@@ -1233,7 +1277,7 @@ pub struct Window {
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
     #[cfg(feature = "profiler")]
-    window_profiler: profiler::WindowProfiler,
+    pub(crate) window_profiler: profiler::WindowProfiler,
     last_input_modality: InputModality,
     touch_gestures: TouchGestureRecognizer,
     touch_prediction_enabled: bool,
@@ -1723,8 +1767,18 @@ impl Window {
             let mut deferred_force_render = false;
             move |request_frame_options| {
                 #[cfg(feature = "profiler")]
-                let _foreground_turn = profiler::journal::foreground_turn();
-                // This must be checked before anything else: if this request
+                let (_foreground_turn, window_id) = {
+                    let foreground_turn = profiler::journal::foreground_turn();
+                    let window_id = handle.window_id();
+                    profiler::journal::record_platform_signal(profiler::journal::PlatformSignal {
+                        window_id,
+                        signal_at: request_frame_options.signal_at,
+                        handled_at: Instant::now(),
+                        source: request_frame_options.signal_source,
+                    });
+                    (foreground_turn, window_id)
+                };
+                // This must be checked before accessing App: if this request
                 // arrived re-entrantly while a draw is on this thread's stack
                 // (e.g. via a nested message pump in the Windows window
                 // procedure), drawing would nest draws, and even touching the
@@ -1742,6 +1796,8 @@ impl Window {
                 if draw_in_progress() {
                     log::debug!("deferring re-entrant window draw request");
                     deferred_force_render |= request_frame_options.force_render;
+                    #[cfg(feature = "profiler")]
+                    profiler::journal::record_reentrant_frame_skipped(window_id, Instant::now());
                     return;
                 }
                 // Take the deferred flag first: `||` short-circuits, and leaving
@@ -1763,15 +1819,16 @@ impl Window {
                 {
                     None
                 } else if !active.get() && !input_rate_tracker.borrow_mut().is_high_rate() {
-                    inactive_frame_interval
+                    inactive_frame_interval.map(|interval| (interval, FrameRateLimit::Inactive))
                 } else if let Some(ThermalState::Critical | ThermalState::Serious) = thermal_state {
-                    Some(Duration::from_micros(16667))
+                    Some((Duration::from_micros(16667), FrameRateLimit::Thermal))
                 } else {
                     None
                 };
 
                 let now = Instant::now();
-                if let Some(min_interval) = min_frame_interval {
+                #[cfg_attr(not(feature = "profiler"), expect(unused_variables))]
+                if let Some((min_interval, limit)) = min_frame_interval {
                     if let Some(last_frame) = last_frame_time.get()
                         && now.duration_since(last_frame) < min_interval
                     {
@@ -1788,6 +1845,19 @@ impl Window {
                         // unserved; platforms that stop requesting frames for
                         // idle windows need a wakeup to deliver the retry.
                         invalidator.wake_platform();
+                        #[cfg(feature = "profiler")]
+                        profiler::journal::record_frame_skipped(
+                            window_id,
+                            Instant::now(),
+                            match limit {
+                                FrameRateLimit::Inactive => {
+                                    profiler::journal::FrameSkipReason::InactiveFrameRateLimit
+                                }
+                                FrameRateLimit::Thermal => {
+                                    profiler::journal::FrameSkipReason::ThermalFrameRateLimit
+                                }
+                            },
+                        );
                         return;
                     }
                 }
@@ -1811,10 +1881,15 @@ impl Window {
                     || needs_present.get()
                     || input_rate_tracker.borrow_mut().is_high_rate();
 
-                if invalidator.is_dirty() || force_render {
+                let should_draw = invalidator.is_dirty() || force_render;
+                if should_draw {
                     measure("frame duration", || {
                         handle
                             .update(&mut cx, |_, window, cx| {
+                                #[cfg(feature = "profiler")]
+                                window
+                                    .window_profiler
+                                    .record_frame_signal(request_frame_options.signal_at);
                                 if force_render {
                                     // Bypass cached view reuse so we don't replay stale
                                     // atlas tile references after a GPU device recovery.
@@ -1850,6 +1925,14 @@ impl Window {
                 if invalidator.is_dirty() || !next_frame_callbacks.borrow().is_empty() {
                     invalidator.wake_platform();
                 }
+                #[cfg(feature = "profiler")]
+                if !should_draw {
+                    profiler::journal::record_frame_skipped(
+                        window_id,
+                        Instant::now(),
+                        profiler::journal::FrameSkipReason::NoRenderNeeded,
+                    );
+                }
             }
         }));
         invalidator.set_platform_waker(platform_window.frame_waker());
@@ -1884,6 +1967,10 @@ impl Window {
                     .update(&mut cx, |_, window, cx| window.bounds_changed(cx))
                     .log_err();
             }
+        }));
+        platform_window.on_display_changed(Box::new({
+            let cx = cx.to_async();
+            move || cx.update(|cx| Window::display_changed(handle, cx))
         }));
         platform_window.on_appearance_changed(Box::new({
             let cx = cx.to_async();
@@ -2040,6 +2127,7 @@ impl Window {
             removed: false,
             platform_window,
             display_id,
+            display_observers: SubscriberSet::new(),
             is_resizable,
             is_minimizable,
             sprite_atlas,
@@ -2050,7 +2138,7 @@ impl Window {
             viewport_size: content_size,
             layout_engine: Some(TaffyLayoutEngine::new()),
             root: None,
-            element_id_stack: SmallVec::default(),
+            element_id_stack: ElementIdStack::default(),
             text_style_stack: Vec::new(),
             rendered_entity_stack: Vec::new(),
             element_offset_stack: Vec::new(),
@@ -2075,13 +2163,6 @@ impl Window {
             modifiers,
             capslock,
             scale_factor,
-            magnification: Magnification::IDENTITY,
-            magnification_live: false,
-            magnification_live_raster_exact: false,
-            paint_magnification: 1.0,
-            paint_raster_magnification: 1.0,
-            mouse_window_position: mouse_position,
-            magnified_glyph_keys: FxHashMap::default(),
             bounds_observers: SubscriberSet::new(),
             appearance,
             appearance_observers: SubscriberSet::new(),
@@ -2140,19 +2221,6 @@ impl Window {
 pub struct DispatchEventResult {
     pub propagate: bool,
     pub default_prevented: bool,
-}
-
-/// Scales sprite bounds by `stretch`, used to draw a glyph rasterized at a quantized scale
-/// during a live magnification gesture at the frame's real scale.
-#[inline]
-fn stretch_sprite_bounds(bounds: Bounds<ScaledPixels>, stretch: f32) -> Bounds<ScaledPixels> {
-    if stretch == 1.0 {
-        return bounds;
-    }
-    Bounds {
-        origin: bounds.origin.map(|c| ScaledPixels(c.0 * stretch)),
-        size: bounds.size.map(|c| ScaledPixels(c.0 * stretch)),
-    }
 }
 
 /// Indicates which region of the window is visible. Content falling outside of this mask will not be
@@ -2492,6 +2560,7 @@ impl Window {
     pub(crate) fn dispatch_keystroke_observers(
         &mut self,
         keystroke: &Keystroke,
+        input_preference: InputPreference,
         action: Option<&dyn Action>,
         context_stack: Vec<KeyContext>,
         cx: &mut App,
@@ -2500,6 +2569,7 @@ impl Window {
             (callback)(
                 &KeystrokeEvent {
                     keystroke: keystroke.clone(),
+                    input_preference,
                     action: action.map(|action| action.boxed_clone()),
                     context_stack: context_stack.clone(),
                 },
@@ -2512,6 +2582,7 @@ impl Window {
     pub(crate) fn dispatch_keystroke_interceptors(
         &mut self,
         keystroke: &Keystroke,
+        input_preference: InputPreference,
         context_stack: Vec<KeyContext>,
         cx: &mut App,
     ) {
@@ -2521,6 +2592,7 @@ impl Window {
                 (callback)(
                     &KeystrokeEvent {
                         keystroke: keystroke.clone(),
+                        input_preference,
                         action: None,
                         context_stack: context_stack.clone(),
                     },
@@ -2719,20 +2791,72 @@ impl Window {
     pub fn bounds_changed(&mut self, cx: &mut App) {
         self.scale_factor = self.platform_window.scale_factor();
         self.viewport_size = self.platform_window.content_size();
-        self.display_id = self.platform_window.display().map(|display| display.id());
-        self.mouse_window_position = self.platform_window.mouse_position();
-        self.magnification = self
-            .magnification
-            .clamped(self.viewport_size, self.scale_factor);
-        self.mouse_position = self
-            .magnification
-            .window_to_content(self.mouse_window_position);
+        self.mouse_position = self.platform_window.mouse_position();
 
         self.refresh();
 
         self.bounds_observers
             .clone()
             .retain(&(), |callback| callback(self, cx));
+    }
+
+    fn display_changed(handle: AnyWindowHandle, cx: &mut App) {
+        let moved_to = handle
+            .update(cx, |_, window, _| {
+                let display_id = window.platform_window.display().map(|display| display.id());
+                let moved = display_id != window.display_id;
+                window.display_id = display_id;
+                moved.then_some(display_id)
+            })
+            .log_err()
+            .flatten();
+        let Some(display_id) = moved_to else {
+            return;
+        };
+        // The platform's notifications about the window and about displays
+        // arrive in no guaranteed order, so make sure App knows the display
+        // before the window's observers read its state.
+        if let Some(display_id) = display_id
+            && !cx.knows_display(display_id)
+        {
+            cx.displays_changed();
+        }
+        handle
+            .update(cx, |_, window, cx| window.notify_display_observers(cx))
+            .log_err();
+    }
+
+    pub(crate) fn notify_display_observers(&mut self, cx: &mut App) {
+        self.display_observers
+            .clone()
+            .retain(&(), |callback| callback(self, cx));
+    }
+
+    /// The time between refreshes of the display the window is on, as of the
+    /// platform's last display change notification. Variable refresh rate
+    /// displays report their maximum rate. Returns `None` when the platform
+    /// doesn't report it.
+    pub fn refresh_interval(&self, cx: &App) -> Option<Duration> {
+        cx.display_refresh_interval(self.display_id?)
+    }
+
+    /// Registers a callback invoked when the window moves to another display
+    /// or its display's properties change, for example its refresh
+    /// interval. [`Self::refresh_interval`] already returns the new value
+    /// when the callback runs.
+    pub fn observe_window_display(
+        &self,
+        mut callback: impl FnMut(&mut Window, &mut App) + 'static,
+    ) -> Subscription {
+        let (subscription, activate) = self.display_observers.insert(
+            (),
+            Box::new(move |window, cx| {
+                callback(window, cx);
+                true
+            }),
+        );
+        activate();
+        subscription
     }
 
     /// Returns the bounds of the current window in the global coordinate space, which could span across multiple displays.
@@ -2964,225 +3088,8 @@ impl Window {
     /// The scale factor of the display associated with the window. For example, it could
     /// return 2.0 for a "retina" display, indicating that each logical pixel should actually
     /// be rendered as two pixels on screen.
-    ///
-    /// While painting a magnified window (see [`Window::set_magnification`]) this includes
-    /// the magnification, so it is always the number of device pixels one logical content
-    /// pixel covers in the frame being painted. Layout and prepaint see the display scale.
     pub fn scale_factor(&self) -> f32 {
-        self.scale_factor * self.paint_magnification
-    }
-
-    /// The scale glyphs and SVGs are rasterized at in the frame being painted. Equal to
-    /// [`Self::scale_factor`] except while a magnification gesture is live.
-    fn raster_scale_factor(&self) -> f32 {
-        self.scale_factor * self.paint_raster_magnification
-    }
-
-    /// The window's visual magnification. See [`Magnification`].
-    pub fn magnification(&self) -> Magnification {
-        self.magnification
-    }
-
-    /// The part of the content currently visible through the window viewport.
-    /// Overlay placement uses these bounds without changing the document layout.
-    pub fn visible_content_bounds(&self) -> Bounds<Pixels> {
-        self.magnification.visible_content(self.viewport_size())
-    }
-
-    pub(crate) fn accessibility_bounds(&self, bounds: Bounds<Pixels>) -> accesskit::Rect {
-        let bounds = self.magnification.content_to_window_bounds(bounds);
-        let scale = self.scale_factor;
-        accesskit::Rect {
-            x0: (bounds.left().0 * scale) as f64,
-            y0: (bounds.top().0 * scale) as f64,
-            x1: (bounds.right().0 * scale) as f64,
-            y1: (bounds.bottom().0 * scale) as f64,
-        }
-    }
-
-    /// Magnifies what the window paints without changing layout, like pinch zoom in a
-    /// browser. Text and SVGs are re-rasterized at the magnified scale so they stay crisp;
-    /// input positions are mapped back to content coordinates before dispatch, and scroll
-    /// deltas pan the magnified view until it reaches an edge before reaching the content.
-    ///
-    /// The value is clamped to the viewport; [`Self::magnification`] returns what was applied.
-    pub fn set_magnification(&mut self, magnification: Magnification) {
-        let magnification = magnification.clamped(self.viewport_size, self.scale_factor);
-        if magnification == self.magnification {
-            return;
-        }
-        self.magnification = magnification;
-        self.mouse_position = magnification.window_to_content(self.mouse_window_position);
-        self.refresh();
-    }
-
-    /// Sets the magnification scale while keeping `content_anchor` (a content point, such
-    /// as a [`crate::PinchEvent`] position) where it currently appears in the window.
-    pub fn magnify_about(&mut self, content_anchor: Point<Pixels>, scale: f32) {
-        self.set_magnification(self.magnification.zoomed_about(content_anchor, scale));
-    }
-
-    /// Removes any magnification.
-    pub fn reset_magnification(&mut self) {
-        self.set_magnification(Magnification::IDENTITY);
-    }
-
-    /// Marks a magnification gesture (such as a pinch) as in progress. While live, glyphs
-    /// and SVGs are rasterized at a few quantized scales and drawn slightly stretched, so
-    /// each frame of the gesture does not rasterize every glyph again. Clearing it redraws
-    /// at the exact scale and releases the glyph rasterizations the window no longer uses.
-    pub fn set_magnification_live(&mut self, live: bool) {
-        if self.magnification_live != live {
-            self.magnification_live = live;
-            self.refresh();
-        }
-    }
-
-    /// Whether a magnification gesture is in progress; see [`Self::set_magnification_live`].
-    pub fn is_magnification_live(&self) -> bool {
-        self.magnification_live
-    }
-
-    /// Draws a live gesture at its exact scale without releasing cached glyph sizes.
-    /// Use this when the scale stops changing at an app's zoom limit; disable it
-    /// when the gesture moves away from the limit to resume quantized rasterization.
-    pub fn set_magnification_live_raster_exact(&mut self, exact: bool) {
-        if self.magnification_live_raster_exact != exact {
-            self.magnification_live_raster_exact = exact;
-            self.refresh();
-        }
-    }
-
-    /// Starts painting with the window's magnification applied.
-    fn begin_magnified_paint(&mut self) {
-        let magnification = self.magnification;
-        if magnification.is_identity() {
-            return;
-        }
-        self.paint_magnification = magnification.scale;
-        self.paint_raster_magnification = magnification
-            .raster_scale(self.magnification_live && !self.magnification_live_raster_exact);
-        let device_viewport =
-            Bounds::new(Point::default(), self.viewport_size).scale(self.scale_factor);
-        self.next_frame.scene.set_view_transform(
-            magnification.device_translation(self.scale_factor),
-            Some(device_viewport),
-        );
-    }
-
-    fn end_magnified_paint(&mut self) {
-        self.paint_magnification = 1.0;
-        self.paint_raster_magnification = 1.0;
-    }
-
-    /// Frees glyph rasterizations made at magnified scales the window no longer paints at.
-    /// Runs only once a gesture settles, so a pinch keeps its few quantized scales cached.
-    fn evict_stale_magnified_glyphs(&mut self) {
-        if self.magnification_live || self.magnified_glyph_keys.is_empty() {
-            return;
-        }
-        let current = (self.scale_factor * self.magnification.scale).to_bits();
-        let sprite_atlas = &self.sprite_atlas;
-        self.magnified_glyph_keys.retain(|scale_bits, keys| {
-            if *scale_bits == current {
-                return true;
-            }
-            for key in keys.drain(..) {
-                sprite_atlas.remove(&key);
-            }
-            false
-        });
-    }
-
-    /// Maps positions in platform input from window to content coordinates and lets
-    /// scrolling pan a magnified view before it reaches the content.
-    fn unmagnify_input(&mut self, event: PlatformInput) -> PlatformInput {
-        match &event {
-            PlatformInput::MouseMove(e) => self.mouse_window_position = e.position,
-            PlatformInput::MouseDown(e) => self.mouse_window_position = e.position,
-            PlatformInput::MouseUp(e) => self.mouse_window_position = e.position,
-            PlatformInput::ScrollWheel(e) => self.mouse_window_position = e.position,
-            PlatformInput::Pinch(e) => self.mouse_window_position = e.position,
-            _ => {}
-        }
-        let m = self.magnification;
-        if m.is_identity() {
-            return event;
-        }
-        let map = |position: Point<Pixels>| m.window_to_content(position);
-        match event {
-            PlatformInput::MouseDown(mut e) => {
-                e.position = map(e.position);
-                PlatformInput::MouseDown(e)
-            }
-            PlatformInput::MouseUp(mut e) => {
-                e.position = map(e.position);
-                PlatformInput::MouseUp(e)
-            }
-            PlatformInput::MouseMove(mut e) => {
-                e.position = map(e.position);
-                PlatformInput::MouseMove(e)
-            }
-            PlatformInput::MousePressure(mut e) => {
-                e.position = map(e.position);
-                PlatformInput::MousePressure(e)
-            }
-            PlatformInput::MouseExited(mut e) => {
-                e.position = map(e.position);
-                PlatformInput::MouseExited(e)
-            }
-            PlatformInput::Pinch(mut e) => {
-                e.position = map(e.position);
-                PlatformInput::Pinch(e)
-            }
-            PlatformInput::Touch(mut e) => {
-                e.position = map(e.position);
-                e.predicted_position = e.predicted_position.map(map);
-                PlatformInput::Touch(e)
-            }
-            PlatformInput::ScrollWheel(mut e) => {
-                e.position = map(e.position);
-                e.delta = self.pan_magnified_view(e.delta);
-                PlatformInput::ScrollWheel(e)
-            }
-            PlatformInput::FileDrop(FileDropEvent::Entered { position, paths }) => {
-                PlatformInput::FileDrop(FileDropEvent::Entered {
-                    position: map(position),
-                    paths,
-                })
-            }
-            PlatformInput::FileDrop(FileDropEvent::Pending { position }) => {
-                PlatformInput::FileDrop(FileDropEvent::Pending {
-                    position: map(position),
-                })
-            }
-            PlatformInput::FileDrop(FileDropEvent::Submit { position }) => {
-                PlatformInput::FileDrop(FileDropEvent::Submit {
-                    position: map(position),
-                })
-            }
-            event => event,
-        }
-    }
-
-    /// Pans the magnified view by a scroll delta and returns the part it could not absorb,
-    /// converted to content pixels, for the content to scroll by.
-    fn pan_magnified_view(&mut self, delta: ScrollDelta) -> ScrollDelta {
-        let scale = self.magnification.scale;
-        let window_delta = match delta {
-            ScrollDelta::Pixels(delta) => delta,
-            ScrollDelta::Lines(lines) => lines.map(|c| px(c * MAGNIFIED_PAN_PIXELS_PER_LINE)),
-        };
-        let (panned, remaining) =
-            self.magnification
-                .panned_by(window_delta, self.viewport_size, self.scale_factor);
-        self.set_magnification(panned);
-        match delta {
-            ScrollDelta::Pixels(_) => ScrollDelta::Pixels(remaining.map(|c| c / scale)),
-            ScrollDelta::Lines(_) => {
-                ScrollDelta::Lines(remaining.map(|c| c.0 / MAGNIFIED_PAN_PIXELS_PER_LINE / scale))
-            }
-        }
+        self.scale_factor
     }
 
     /// Overrides the display scale factor for tests.
@@ -3215,7 +3122,7 @@ impl Window {
         f: impl FnOnce(&GlobalElementId, &mut Self) -> R,
     ) -> R {
         self.with_id(element_id, |this| {
-            let global_id = GlobalElementId(Arc::from(&*this.element_id_stack));
+            let global_id = this.element_id_stack.global_id();
 
             f(&global_id, this)
         })
@@ -3646,7 +3553,6 @@ impl Window {
         self.record_entities_accessed(cx);
         self.reset_cursor_style(cx);
         self.refreshing = false;
-        self.evict_stale_magnified_glyphs();
         self.invalidator.set_phase(DrawPhase::None);
         // Focus listeners may move focus (e.g. a dock forwarding focus to its active
         // panel). `Window::focus` suppresses `refresh` while a draw is in progress, so
@@ -3659,6 +3565,8 @@ impl Window {
 
         #[cfg(feature = "profiler")]
         {
+            self.window_profiler
+                .set_refresh_interval(self.refresh_interval(cx));
             let draw_duration = self
                 .window_profiler
                 .end_draw(frame_dirty.dirty_at, frame_dirty.invalidations);
@@ -3789,8 +3697,12 @@ impl Window {
         // stretches to fill the viewport unless explicitly sized, window roots
         // fill the window when their size is `auto`.
         let scale_factor = self.scale_factor();
+        #[cfg(feature = "profiler")]
+        let request_layout_start = Instant::now();
         let mut root_element = self.root.as_ref().unwrap().clone().into_any_element();
         let root_layout_id = root_element.request_layout(self, cx);
+        #[cfg(feature = "profiler")]
+        let prepaint_start = Instant::now();
         self.layout_engine
             .as_mut()
             .unwrap()
@@ -3828,8 +3740,9 @@ impl Window {
         self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
 
         // Now actually paint the elements.
+        #[cfg(feature = "profiler")]
+        let paint_start = Instant::now();
         self.invalidator.set_phase(DrawPhase::Paint);
-        self.begin_magnified_paint();
         root_element.paint(self, cx);
 
         #[cfg(any(feature = "inspector", debug_assertions))]
@@ -3847,7 +3760,14 @@ impl Window {
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector_hitbox(cx);
-        self.end_magnified_paint();
+
+        #[cfg(feature = "profiler")]
+        self.window_profiler
+            .record_draw_phases(profiler::DrawPhases {
+                request_layout: prepaint_start.duration_since(request_layout_start),
+                prepaint: paint_start.duration_since(prepaint_start),
+                paint: Instant::now().duration_since(paint_start),
+            });
 
         // a11y may have been activated/deactivated halfway through the frame
         let a11y_active_start_of_frame = self.a11y.is_active();
@@ -3895,28 +3815,31 @@ impl Window {
 
             let mut tooltip_bounds =
                 Bounds::new(mouse_position + point(px(1.), px(1.)), tooltip_size);
-            let window_bounds = self.visible_content_bounds();
+            let window_bounds = Bounds {
+                origin: Point::default(),
+                size: self.viewport_size(),
+            };
 
             if tooltip_bounds.right() > window_bounds.right() {
                 let new_x = mouse_position.x - tooltip_bounds.size.width - px(1.);
-                if new_x >= window_bounds.left() {
+                if new_x >= Pixels::ZERO {
                     tooltip_bounds.origin.x = new_x;
                 } else {
                     tooltip_bounds.origin.x = cmp::max(
-                        window_bounds.left(),
-                        window_bounds.right() - tooltip_bounds.size.width,
+                        Pixels::ZERO,
+                        tooltip_bounds.origin.x - tooltip_bounds.right() - window_bounds.right(),
                     );
                 }
             }
 
             if tooltip_bounds.bottom() > window_bounds.bottom() {
                 let new_y = mouse_position.y - tooltip_bounds.size.height - px(1.);
-                if new_y >= window_bounds.top() {
+                if new_y >= Pixels::ZERO {
                     tooltip_bounds.origin.y = new_y;
                 } else {
                     tooltip_bounds.origin.y = cmp::max(
-                        window_bounds.top(),
-                        window_bounds.bottom() - tooltip_bounds.size.height,
+                        Pixels::ZERO,
+                        tooltip_bounds.origin.y - tooltip_bounds.bottom() - window_bounds.bottom(),
                     );
                 }
             }
@@ -4906,10 +4829,7 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let element_opacity = self.element_opacity();
-        let scale_factor = self.raster_scale_factor();
-        // Draws glyphs rasterized at a quantized scale during a live magnification gesture
-        // at the frame's real scale. Exactly 1.0 otherwise.
-        let stretch = self.scale_factor() / scale_factor;
+        let scale_factor = self.scale_factor();
         let glyph_origin = origin.scale(scale_factor);
 
         let quantized_origin = Point::new(
@@ -4938,14 +4858,17 @@ impl Window {
 
         let raster_bounds = self.text_system().raster_bounds(&params)?;
         if !raster_bounds.is_zero() {
-            let tile = self.get_or_rasterize_glyph(&params)?;
-            let bounds = stretch_sprite_bounds(
-                Bounds {
-                    origin: integer_origin + raster_bounds.origin.map(Into::into),
-                    size: tile.bounds.size.map(Into::into),
-                },
-                stretch,
-            );
+            let tile = self
+                .sprite_atlas
+                .get_or_insert_with(params.clone().into(), &mut || {
+                    let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
+                    Ok(Some((size, Cow::Owned(bytes))))
+                })?
+                .expect("Callback above only errors or returns Some");
+            let bounds = Bounds {
+                origin: integer_origin + raster_bounds.origin.map(Into::into),
+                size: tile.bounds.size.map(Into::into),
+            };
             let content_mask = self.snapped_content_mask();
 
             if subpixel_rendering {
@@ -4971,28 +4894,6 @@ impl Window {
             }
         }
         Ok(())
-    }
-
-    /// Looks up or rasterizes a glyph, remembering rasterizations made while magnified so
-    /// they can be evicted when the window settles at another scale.
-    fn get_or_rasterize_glyph(&mut self, params: &RenderGlyphParams) -> Result<AtlasTile> {
-        let key: AtlasKey = params.clone().into();
-        let mut rasterized = false;
-        let tile = self
-            .sprite_atlas
-            .get_or_insert_with(key.clone(), &mut || {
-                rasterized = true;
-                let (size, bytes) = self.text_system().rasterize_glyph(params)?;
-                Ok(Some((size, Cow::Owned(bytes))))
-            })?
-            .expect("Callback above only errors or returns Some");
-        if rasterized && self.paint_magnification != 1.0 {
-            self.magnified_glyph_keys
-                .entry(params.scale_factor.to_bits())
-                .or_default()
-                .push(key);
-        }
-        Ok(tile)
     }
 
     fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
@@ -5031,8 +4932,7 @@ impl Window {
     ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
-        let scale_factor = self.raster_scale_factor();
-        let stretch = self.scale_factor() / scale_factor;
+        let scale_factor = self.scale_factor();
         let glyph_origin = origin.scale(scale_factor);
         let integer_origin = glyph_origin.map(|c| ScaledPixels(round_half_toward_zero(c.0)));
         let params = RenderGlyphParams {
@@ -5048,15 +4948,18 @@ impl Window {
 
         let raster_bounds = self.text_system().raster_bounds(&params)?;
         if !raster_bounds.is_zero() {
-            let tile = self.get_or_rasterize_glyph(&params)?;
+            let tile = self
+                .sprite_atlas
+                .get_or_insert_with(params.clone().into(), &mut || {
+                    let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
+                    Ok(Some((size, Cow::Owned(bytes))))
+                })?
+                .expect("Callback above only errors or returns Some");
 
-            let bounds = stretch_sprite_bounds(
-                Bounds {
-                    origin: integer_origin + raster_bounds.origin.map(Into::into),
-                    size: tile.bounds.size.map(Into::into),
-                },
-                stretch,
-            );
+            let bounds = Bounds {
+                origin: integer_origin + raster_bounds.origin.map(Into::into),
+                size: tile.bounds.size.map(Into::into),
+            };
             let content_mask = self.snapped_content_mask();
             let opacity = self.element_opacity();
 
@@ -5090,18 +4993,12 @@ impl Window {
 
         let element_opacity = self.element_opacity();
         let bounds = self.snap_bounds(bounds);
-        // During a live magnification gesture, rasterize at a quantized scale; the sprite
-        // below is drawn at `bounds`, so the tile is stretched to fit. Exactly 1.0 otherwise.
-        let raster_ratio = self.raster_scale_factor() / self.scale_factor();
 
         let params = RenderSvgParams {
             path,
-            size:
-                bounds.size.map(|pixels| {
-                    DevicePixels::from(
-                        (pixels.0 * raster_ratio * SMOOTH_SVG_SCALE_FACTOR).ceil() as i32
-                    )
-                }),
+            size: bounds.size.map(|pixels| {
+                DevicePixels::from((pixels.0 * SMOOTH_SVG_SCALE_FACTOR).ceil() as i32)
+            }),
         };
 
         let Some(tile) =
@@ -5117,17 +5014,16 @@ impl Window {
             return Ok(());
         };
         let content_mask = self.snapped_content_mask();
-        let tile_scale = SMOOTH_SVG_SCALE_FACTOR * raster_ratio;
         let svg_bounds = Bounds {
             origin: bounds.center()
                 - Point::new(
-                    ScaledPixels(tile.bounds.size.width.0 as f32 / tile_scale / 2.),
-                    ScaledPixels(tile.bounds.size.height.0 as f32 / tile_scale / 2.),
+                    ScaledPixels(tile.bounds.size.width.0 as f32 / SMOOTH_SVG_SCALE_FACTOR / 2.),
+                    ScaledPixels(tile.bounds.size.height.0 as f32 / SMOOTH_SVG_SCALE_FACTOR / 2.),
                 ),
             size: tile
                 .bounds
                 .size
-                .map(|value| ScaledPixels(value.0 as f32 / tile_scale)),
+                .map(|value| ScaledPixels(value.0 as f32 / SMOOTH_SVG_SCALE_FACTOR)),
         };
         let final_bounds = svg_bounds
             .map_origin(|value| ScaledPixels(round_half_toward_zero(value.0)))
@@ -5255,8 +5151,12 @@ impl Window {
     /// Paint a surface into the scene for the next frame at the current z-index.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
-    #[cfg(target_os = "macos")]
-    pub fn paint_surface(&mut self, bounds: Bounds<Pixels>, image_buffer: CVPixelBuffer) {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub fn paint_surface(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        image_buffer: CFRetained<CVPixelBuffer>,
+    ) {
         use crate::PaintSurface;
 
         self.invalidator.debug_assert_paint();
@@ -5694,7 +5594,6 @@ impl Window {
         #[cfg(feature = "profiler")]
         self.window_profiler.begin_input(event.kind_name());
         let update_count_before = self.invalidator.update_count();
-        let event = self.unmagnify_input(event);
         // Track input modality for focus-visible styling and hover suppression.
         // Hover is suppressed during keyboard modality so that keyboard navigation
         // doesn't show hover highlights on the item under the mouse cursor.
@@ -6086,6 +5985,27 @@ impl Window {
         }
     }
 
+    // If modifiers are not excessive (e.g. AltGr), and the input handler is accepting text input,
+    // we prefer the text input over bindings.
+    fn input_preference(&mut self, event: &dyn Any, cx: &mut App) -> InputPreference {
+        let prefer_character_input = event
+            .downcast_ref::<KeyDownEvent>()
+            .is_some_and(|key_down_event| key_down_event.prefer_character_input);
+        if !prefer_character_input {
+            return InputPreference::KeyBindings;
+        }
+        let Some(mut input_handler) = self.platform_window.take_input_handler() else {
+            return InputPreference::KeyBindings;
+        };
+        let accepts_text_input = input_handler.accepts_text_input(self, cx);
+        self.platform_window.set_input_handler(input_handler);
+        if accepts_text_input {
+            InputPreference::CharacterInput
+        } else {
+            InputPreference::KeyBindings
+        }
+    }
+
     fn dispatch_key_event(&mut self, event: &dyn Any, cx: &mut App) {
         if self.invalidator.is_dirty() {
             self.draw(cx).clear(cx);
@@ -6140,16 +6060,31 @@ impl Window {
         }
 
         let Some(keystroke) = keystroke else {
-            self.finish_dispatch_key_event(event, None, dispatch_path, self.context_stack(), cx);
+            self.finish_dispatch_key_event(
+                event,
+                None,
+                InputPreference::KeyBindings,
+                dispatch_path,
+                self.context_stack(),
+                cx,
+            );
             return;
         };
 
+        let input_preference = self.input_preference(event, cx);
+
         cx.propagate_event = true;
-        self.dispatch_keystroke_interceptors(&keystroke, self.context_stack(), cx);
+        self.dispatch_keystroke_interceptors(
+            &keystroke,
+            input_preference,
+            self.context_stack(),
+            cx,
+        );
         if !cx.propagate_event {
             self.finish_dispatch_key_event(
                 event,
                 Some(&keystroke),
+                input_preference,
                 dispatch_path,
                 self.context_stack(),
                 cx,
@@ -6211,28 +6146,15 @@ impl Window {
             return;
         }
 
-        let skip_bindings = event
-            .downcast_ref::<KeyDownEvent>()
-            .filter(|key_down_event| key_down_event.prefer_character_input)
-            .map(|_| {
-                self.platform_window
-                    .take_input_handler()
-                    .map_or(false, |mut input_handler| {
-                        let accepts = input_handler.accepts_text_input(self, cx);
-                        self.platform_window.set_input_handler(input_handler);
-                        // If modifiers are not excessive (e.g. AltGr), and the input handler is accepting text input,
-                        // we prefer the text input over bindings.
-                        accepts
-                    })
-            })
-            .unwrap_or(false);
-
-        if !skip_bindings {
+        // Interceptors or replayed actions may have changed whether the input handler accepts text.
+        let input_preference = self.input_preference(event, cx);
+        if input_preference == InputPreference::KeyBindings {
             for binding in match_result.bindings {
                 self.dispatch_action_on_node(node_id, binding.action.as_ref(), cx);
                 if !cx.propagate_event {
                     self.dispatch_keystroke_observers(
                         &keystroke,
+                        input_preference,
                         Some(binding.action.as_ref()),
                         match_result.context_stack,
                         cx,
@@ -6246,6 +6168,7 @@ impl Window {
         self.finish_dispatch_key_event(
             event,
             Some(&keystroke),
+            input_preference,
             dispatch_path,
             match_result.context_stack,
             cx,
@@ -6295,6 +6218,7 @@ impl Window {
         &mut self,
         event: &dyn Any,
         recognized_keystroke: Option<&Keystroke>,
+        input_preference: InputPreference,
         dispatch_path: SmallVec<[DispatchNodeId; 32]>,
         context_stack: Vec<KeyContext>,
         cx: &mut App,
@@ -6310,7 +6234,7 @@ impl Window {
         }
 
         if let Some(keystroke) = recognized_keystroke {
-            self.dispatch_keystroke_observers(keystroke, None, context_stack, cx);
+            self.dispatch_keystroke_observers(keystroke, input_preference, None, context_stack, cx);
         }
     }
 
@@ -6514,6 +6438,7 @@ impl Window {
                 if !cx.propagate_event {
                     self.dispatch_keystroke_observers(
                         &replay.keystroke,
+                        InputPreference::KeyBindings,
                         Some(binding.action.as_ref()),
                         Vec::default(),
                         cx,
@@ -7130,8 +7055,7 @@ impl Window {
         match request.action {
             accesskit::Action::Click => {
                 if let Some(bounds) = self.a11y.node_bounds.get(&request.target_node).copied() {
-                    // Dispatch maps window positions to content; a11y bounds are content.
-                    let center = self.magnification.content_to_window(bounds.center());
+                    let center = bounds.center();
                     let mouse_down = PlatformInput::MouseDown(crate::MouseDownEvent {
                         button: MouseButton::Left,
                         position: center,
@@ -7964,7 +7888,163 @@ mod tests {
         TouchId, TouchPhase, Underline, UnderlineStyle, Window, WindowAppearance, WindowOptions,
         canvas, div, hsla, point, px, size,
     };
-    use crate::{Magnification, ScrollDelta, ScrollWheelEvent};
+
+    #[cfg(feature = "profiler")]
+    #[gpui::test]
+    fn test_frame_requests_and_skips_are_journaled(cx: &mut TestAppContext) {
+        use crate::FrameRequestSource;
+        use crate::profiler::journal::{
+            self, ForegroundJournalEntry, FrameSkipReason, IntervalBoundary,
+        };
+        use scheduler::Instant;
+
+        cx.app.borrow_mut().mode = crate::app::GpuiMode::Production;
+        let window = cx.add_window(|_, _| EmptyView);
+        let platform_window = cx.test_window(window.into());
+        platform_window.simulate_frame_request(RequestFrameOptions::default());
+        let (journal, _guard) = journal::install_test_foreground_journal(64, 4);
+        let mut collector = journal.collector();
+
+        for (signal_at, source) in [
+            (Some(Instant::now()), FrameRequestSource::NativeCallback),
+            (Some(Instant::now()), FrameRequestSource::LocalSchedule),
+            (None, FrameRequestSource::NativeCallback),
+        ] {
+            platform_window.simulate_frame_request(RequestFrameOptions {
+                signal_at,
+                signal_source: source,
+                require_presentation: true,
+                ..Default::default()
+            });
+            let entries = collector.collect_unseen().entries;
+            let signal_index = entries
+                .iter()
+                .position(|entry| {
+                    matches!(
+                        entry,
+                        ForegroundJournalEntry::PlatformSignal(signal)
+                            if signal.window_id == window.window_id()
+                                && signal.signal_at == signal_at
+                                && signal.source == source
+                                && signal_at.is_none_or(|at| signal.handled_at >= at)
+                    )
+                })
+                .expect("frame request metadata");
+            let skip_index = entries
+                .iter()
+                .position(|entry| {
+                    matches!(
+                        entry,
+                        ForegroundJournalEntry::Boundary(IntervalBoundary::FrameSkipped(skipped))
+                            if skipped.window_id == window.window_id()
+                                && skipped.reason == FrameSkipReason::NoRenderNeeded
+                    )
+                })
+                .expect("completed no-render boundary");
+            assert!(signal_index < skip_index);
+        }
+    }
+
+    #[cfg(feature = "profiler")]
+    #[gpui::test]
+    fn test_frame_demand_survives_throttling(cx: &mut TestAppContext) {
+        use crate::profiler::journal::{
+            self, ForegroundJournalEntry, FrameSkipReason, IntervalBoundary,
+        };
+        use scheduler::Instant;
+
+        // Test mode draws during effect flushing, bypassing platform frame throttling.
+        cx.app.borrow_mut().mode = crate::app::GpuiMode::Production;
+        let (journal, _guard) = journal::install_test_foreground_journal(256, 4);
+        let mut collector = journal.collector();
+        for initially_dirty in [true, false] {
+            // Keep the throttle closed without depending on short wall-clock deadlines.
+            let window = cx
+                .app
+                .borrow_mut()
+                .open_window(
+                    WindowOptions {
+                        inactive_frame_interval: Some(Duration::from_secs(3600)),
+                        ..Default::default()
+                    },
+                    |_, cx| cx.new(|_| EmptyView),
+                )
+                .expect("open inactive test window");
+            let platform_window = cx.test_window(window.into());
+            platform_window.simulate_active_status_change(false);
+            platform_window.simulate_frame_request(RequestFrameOptions::default());
+            let callback_ran = Rc::new(Cell::new(false));
+            let draws_before = window
+                .update(cx, |_, window, _| {
+                    let draws_before = window
+                        .frame_duration_snapshot()
+                        .draw_duration_histogram
+                        .len();
+                    if initially_dirty {
+                        window.refresh();
+                    }
+                    window.on_next_frame({
+                        let callback_ran = callback_ran.clone();
+                        move |window, _| {
+                            callback_ran.set(true);
+                            window.refresh();
+                        }
+                    });
+                    draws_before
+                })
+                .expect("schedule throttled frame");
+            // Skips only seal retained work, so give the throttled skip some.
+            let input_at = Instant::now();
+            journal::record_input(journal::InputTiming {
+                kind: "test",
+                start: input_at,
+                end: input_at,
+                caused_invalidation: false,
+            });
+            collector.collect_unseen();
+            platform_window.simulate_frame_request(RequestFrameOptions {
+                signal_at: Some(Instant::now()),
+                ..Default::default()
+            });
+            window
+                .update(cx, |_, window, _| {
+                    assert_eq!(
+                        window
+                            .frame_duration_snapshot()
+                            .draw_duration_histogram
+                            .len(),
+                        draws_before,
+                    );
+                })
+                .expect("inspect deferred frame");
+            assert!(!callback_ran.get());
+            assert!(collector.collect_unseen().entries.iter().any(|entry| {
+                matches!(
+                    entry,
+                    ForegroundJournalEntry::Boundary(IntervalBoundary::FrameSkipped(skipped))
+                        if skipped.window_id == window.window_id()
+                            && skipped.reason == FrameSkipReason::InactiveFrameRateLimit
+                )
+            }));
+            platform_window.simulate_frame_request(RequestFrameOptions {
+                signal_at: Some(Instant::now()),
+                require_presentation: true,
+                ..Default::default()
+            });
+            window
+                .update(cx, |_, window, _| {
+                    assert_eq!(
+                        window
+                            .frame_duration_snapshot()
+                            .draw_duration_histogram
+                            .len(),
+                        draws_before + 1,
+                    );
+                })
+                .expect("inspect presented frame");
+            assert!(callback_ran.get());
+        }
+    }
 
     /// Visibility transitions reach observers exactly once each, with the new
     /// state already stored on the window, and never wake the platform for a
@@ -8010,6 +8090,118 @@ mod tests {
             .update(cx, |_, window, _| assert!(window.is_visible()))
             .unwrap();
         assert_eq!(test_window.frame_wake_count(), frame_wake_count);
+    }
+
+    /// App learns display state from the platform's display notifications,
+    /// and a window from the platform's report of which display it is on.
+    #[gpui::test]
+    fn test_display_tracking(cx: &mut TestAppContext) {
+        use crate::{DisplayChanges, DisplayEvent, DisplayId, Subscription};
+
+        let sixty_hertz = Duration::from_secs(1) / 60;
+        let one_hundred_twenty_hertz = Duration::from_secs(1) / 120;
+        let one_hundred_forty_four_hertz = Duration::from_secs(1) / 144;
+
+        let display_events = Rc::new(RefCell::new(Vec::new()));
+        let _display_subscription = cx.update({
+            let display_events = display_events.clone();
+            move |cx| cx.observe_displays(move |event, _| display_events.borrow_mut().push(event))
+        });
+
+        let window = cx.add_window(|window, cx| DisplayTracker {
+            refresh_intervals: Vec::new(),
+            _subscription: cx.observe_window_display(
+                window,
+                |tracker: &mut DisplayTracker, window, cx| {
+                    tracker.refresh_intervals.push(window.refresh_interval(cx));
+                },
+            ),
+        });
+        let window_notifications = Rc::new(RefCell::new(Vec::new()));
+        let _window_subscription = window
+            .update(cx, {
+                let window_notifications = window_notifications.clone();
+                move |_, window, cx| {
+                    assert_eq!(window.refresh_interval(cx), Some(sixty_hertz));
+                    window.observe_window_display(move |window, cx| {
+                        window_notifications
+                            .borrow_mut()
+                            .push((window.display_id, window.refresh_interval(cx)));
+                    })
+                }
+            })
+            .unwrap();
+        let test_window = cx.test_window(window.into());
+
+        // The window may hear that it moved before App hears the display was
+        // connected. App learns about the display before the window's
+        // observers run, and the platform's later notification changes
+        // nothing.
+        cx.test_platform()
+            .connect_display(DisplayId(2), Some(one_hundred_twenty_hertz));
+        test_window.simulate_move_to_display(DisplayId(2));
+        assert_eq!(
+            window_notifications.take(),
+            [(Some(DisplayId(2)), Some(one_hundred_twenty_hertz))]
+        );
+        assert_eq!(display_events.take(), [DisplayEvent::Added(DisplayId(2))]);
+        cx.simulate_display_refresh_interval_change(DisplayId(2), Some(one_hundred_twenty_hertz));
+        assert!(window_notifications.borrow().is_empty());
+
+        // Platforms may report a move that isn't one.
+        test_window.simulate_move_to_display(DisplayId(2));
+        assert!(window_notifications.borrow().is_empty());
+
+        cx.simulate_display_refresh_interval_change(
+            DisplayId(2),
+            Some(one_hundred_forty_four_hertz),
+        );
+        assert_eq!(
+            window_notifications.take(),
+            [(Some(DisplayId(2)), Some(one_hundred_forty_four_hertz))]
+        );
+
+        // Changes to a display the window isn't on don't notify it.
+        cx.simulate_display_refresh_interval_change(DisplayId(1), Some(one_hundred_twenty_hertz));
+        cx.simulate_display_removed(DisplayId(1));
+        assert!(window_notifications.borrow().is_empty());
+
+        assert_eq!(
+            display_events.take(),
+            [
+                DisplayEvent::Changed {
+                    id: DisplayId(2),
+                    changes: DisplayChanges::REFRESH_INTERVAL,
+                },
+                DisplayEvent::Changed {
+                    id: DisplayId(1),
+                    changes: DisplayChanges::REFRESH_INTERVAL,
+                },
+                DisplayEvent::Removed(DisplayId(1)),
+            ]
+        );
+        window
+            .update(cx, |tracker, _, _| {
+                assert_eq!(
+                    tracker.refresh_intervals,
+                    [
+                        Some(one_hundred_twenty_hertz),
+                        Some(one_hundred_forty_four_hertz)
+                    ]
+                );
+            })
+            .unwrap();
+
+        struct DisplayTracker {
+            refresh_intervals: Vec<Option<Duration>>,
+            _subscription: Subscription,
+        }
+
+        impl Render for DisplayTracker {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                Empty
+            }
+        }
     }
 
     #[gpui::test]
@@ -9420,238 +9612,6 @@ mod tests {
                 );
             })
             .unwrap();
-    }
-
-    struct MagnifyTarget {
-        downs: Rc<RefCell<Vec<Point<Pixels>>>>,
-        scrolls: Rc<RefCell<Vec<Point<Pixels>>>>,
-        paint_scales: Rc<RefCell<Vec<f32>>>,
-    }
-
-    impl Render for MagnifyTarget {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            let downs = self.downs.clone();
-            let scrolls = self.scrolls.clone();
-            let paint_scales = self.paint_scales.clone();
-            div()
-                .size_full()
-                .on_scroll_wheel(move |event, _, _| {
-                    scrolls.borrow_mut().push(event.delta.pixel_delta(px(1.)));
-                })
-                .child(
-                    div()
-                        .absolute()
-                        .left(px(100.))
-                        .top(px(100.))
-                        .w(px(50.))
-                        .h(px(50.))
-                        .bg(crate::red())
-                        .on_mouse_down(MouseButton::Left, move |event, _, _| {
-                            downs.borrow_mut().push(event.position);
-                        }),
-                )
-                .child(
-                    canvas(
-                        |_, _, _| {},
-                        move |_, _, window, _| {
-                            paint_scales.borrow_mut().push(window.scale_factor());
-                        },
-                    )
-                    .size_full(),
-                )
-        }
-    }
-
-    #[gpui::test]
-    fn magnification_maps_accessibility_and_overlay_bounds(cx: &mut TestAppContext) {
-        cx.skip_drawing();
-        let handle = cx.open_window(size(px(800.), px(600.)), |_, _| EmptyView);
-        handle
-            .update(cx, |_, window, _| {
-                window.scale_factor = 2.;
-                let bounds = Bounds::new(point(px(150.), px(100.)), size(px(20.), px(10.)));
-                assert_eq!(
-                    window.accessibility_bounds(bounds),
-                    accesskit::Rect::new(300., 200., 340., 220.)
-                );
-                window.set_magnification(Magnification::new(2., point(px(100.), px(50.))));
-                assert_eq!(
-                    window.accessibility_bounds(bounds),
-                    accesskit::Rect::new(200., 200., 280., 240.)
-                );
-                assert_eq!(
-                    window.visible_content_bounds(),
-                    Bounds::new(point(px(100.), px(50.)), size(px(400.), px(300.)))
-                );
-                window.reset_magnification();
-                assert_eq!(
-                    window.visible_content_bounds(),
-                    Bounds::new(Point::default(), size(px(800.), px(600.)))
-                );
-            })
-            .unwrap();
-    }
-
-    #[gpui::test]
-    fn exact_live_raster_preserves_gesture_caches(cx: &mut TestAppContext) {
-        cx.skip_drawing();
-        let handle = cx.add_window(|_, _| EmptyView);
-        handle
-            .update(cx, |_, window, _| {
-                window.set_magnification(Magnification::new(5., Point::default()));
-                window.set_magnification_live(true);
-                window
-                    .magnified_glyph_keys
-                    .insert(2.0_f32.to_bits(), Vec::new());
-                window.set_magnification_live_raster_exact(true);
-                window.begin_magnified_paint();
-                assert_eq!(window.paint_raster_magnification, 5.);
-                window.end_magnified_paint();
-                window.evict_stale_magnified_glyphs();
-                assert!(window.magnified_glyph_keys.contains_key(&2.0_f32.to_bits()));
-
-                window.set_magnification_live_raster_exact(false);
-                window.set_magnification(Magnification::new(4.5, Point::default()));
-                window.begin_magnified_paint();
-                assert!(window.paint_raster_magnification < 4.5);
-                window.end_magnified_paint();
-                window.set_magnification_live(false);
-                window.evict_stale_magnified_glyphs();
-                assert!(!window.magnified_glyph_keys.contains_key(&2.0_f32.to_bits()));
-            })
-            .unwrap();
-    }
-
-    #[gpui::test]
-    fn magnification_scales_paint_and_maps_input_back(cx: &mut TestAppContext) {
-        let downs = Rc::new(RefCell::new(Vec::new()));
-        let scrolls = Rc::new(RefCell::new(Vec::new()));
-        let paint_scales = Rc::new(RefCell::new(Vec::new()));
-        let window = cx.add_window({
-            let (downs, scrolls, paint_scales) =
-                (downs.clone(), scrolls.clone(), paint_scales.clone());
-            move |_, _| MagnifyTarget {
-                downs,
-                scrolls,
-                paint_scales,
-            }
-        });
-        let red_quad = |window: &Window| {
-            window
-                .rendered_frame
-                .scene
-                .quads
-                .iter()
-                .find(|quad| quad.background == crate::red().into())
-                .map(|quad| quad.bounds)
-        };
-        let click = |cx: &mut TestAppContext, x: f32, y: f32| {
-            cx.update_window(window.into(), |_, window, cx| {
-                window.dispatch_event(
-                    MouseDownEvent {
-                        button: MouseButton::Left,
-                        position: point(px(x), px(y)),
-                        modifiers: Default::default(),
-                        click_count: 1,
-                        first_mouse: false,
-                    }
-                    .to_platform_input(),
-                    cx,
-                );
-            })
-            .unwrap();
-        };
-        let scroll = |cx: &mut TestAppContext, dy: f32| {
-            cx.update_window(window.into(), |_, window, cx| {
-                window.dispatch_event(
-                    ScrollWheelEvent {
-                        position: point(px(10.), px(10.)),
-                        delta: ScrollDelta::Pixels(point(px(0.), px(dy))),
-                        ..Default::default()
-                    }
-                    .to_platform_input(),
-                    cx,
-                );
-                window.draw(cx).clear(cx);
-            })
-            .unwrap();
-        };
-
-        let (scale_factor, viewport) = cx
-            .update_window(window.into(), |_, window, cx| {
-                window.draw(cx).clear(cx);
-                (window.scale_factor(), window.viewport_size())
-            })
-            .unwrap();
-        assert_eq!(paint_scales.borrow().last().copied(), Some(scale_factor));
-
-        let magnification = Magnification::new(2., point(px(50.), px(50.)));
-        cx.update_window(window.into(), |_, window, cx| {
-            window.set_magnification(magnification);
-            assert_eq!(window.magnification(), magnification);
-            window.draw(cx).clear(cx);
-            // Outside paint, the scale factor is the display's.
-            assert_eq!(window.scale_factor(), scale_factor);
-            // Content (100, 100) is at window (100, 100): (100 - 50) * 2. The quad is
-            // 50 content px = 100 window px, all in device pixels.
-            let device = |c: f32| ScaledPixels(c * scale_factor);
-            assert_eq!(
-                red_quad(window),
-                Some(Bounds {
-                    origin: point(device(100.), device(100.)),
-                    size: size(device(100.), device(100.)),
-                })
-            );
-        })
-        .unwrap();
-        assert_eq!(
-            paint_scales.borrow().last().copied(),
-            Some(scale_factor * 2.)
-        );
-
-        // Window (150, 150) shows content (125, 125), inside the target.
-        click(cx, 150., 150.);
-        assert_eq!(downs.borrow().as_slice(), [point(px(125.), px(125.))]);
-        // The target now spans window 100..200. Window (60, 60) and (99, 99) show content
-        // (80, 80) and (99.5, 99.5), outside it; window (101, 101) shows (100.5, 100.5).
-        click(cx, 60., 60.);
-        click(cx, 99., 99.);
-        assert_eq!(downs.borrow().len(), 1);
-        click(cx, 101., 101.);
-        assert_eq!(downs.borrow().len(), 2);
-        cx.update_window(window.into(), |_, window, _| {
-            assert_eq!(window.mouse_position(), point(px(100.5), px(100.5)));
-        })
-        .unwrap();
-
-        // Scrolling pans the magnified view first; the content sees nothing left over.
-        scroll(cx, -20.);
-        assert_eq!(scrolls.borrow().last().copied(), Some(Point::default()));
-        let origin_y = cx
-            .update_window(window.into(), |_, window, _| {
-                window.magnification().origin.y
-            })
-            .unwrap();
-        assert_eq!(origin_y, px(60.));
-
-        // Past the bottom edge the rest reaches the content, in content pixels.
-        let max_origin_y = viewport.height / 2.;
-        scroll(cx, -2000.);
-        let absorbed = (max_origin_y - origin_y) * 2.;
-        let expected = (px(-2000.) + absorbed) / 2.;
-        let delta = scrolls.borrow().last().copied().unwrap();
-        assert!(
-            (delta.y - expected).abs() < px(0.01),
-            "{delta:?} vs {expected:?}"
-        );
-        cx.update_window(window.into(), |_, window, cx| {
-            assert_eq!(window.magnification().origin.y, max_origin_y);
-            window.reset_magnification();
-            assert!(window.magnification().is_identity());
-            window.draw(cx).clear(cx);
-        })
-        .unwrap();
-        assert_eq!(paint_scales.borrow().last().copied(), Some(scale_factor));
     }
 }
 

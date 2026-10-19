@@ -147,7 +147,10 @@ impl Element for Anchored {
             self.offset,
         );
 
-        let limits = window.visible_content_bounds();
+        let limits = Bounds {
+            origin: Point::default(),
+            size: window.viewport_size(),
+        };
 
         if self.fit_mode == AnchoredFitMode::SwitchAnchor {
             let mut anchor = self.anchor;
@@ -321,26 +324,6 @@ mod tests {
                     ),
             )
         }
-    }
-
-    #[gpui::test]
-    fn test_anchored_snaps_to_magnified_viewport(cx: &mut TestAppContext) {
-        let handle = cx.open_window(size(px(800.), px(600.)), |_, _| AnchoredTestView {
-            position: point(px(700.), px(500.)),
-        });
-        handle
-            .update(cx, |_, window, _| {
-                window.set_magnification(crate::Magnification::new(2., point(px(100.), px(50.))));
-            })
-            .unwrap();
-        cx.run_until_parked();
-        handle
-            .update(cx, |_, window, _| {
-                let bounds = *window.rendered_frame.debug_bounds.get("MENU").unwrap();
-                assert_eq!(bounds.origin, point(px(300.), px(50.)));
-                assert_eq!(bounds.size, size(px(200.), px(300.)));
-            })
-            .unwrap();
     }
 
     #[gpui::test]
