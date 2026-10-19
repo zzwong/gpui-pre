@@ -9974,6 +9974,48 @@ mod tests {
     }
 
     #[gpui::test]
+    fn magnification_survives_platform_resize_and_scale_change(cx: &mut TestAppContext) {
+        cx.skip_drawing();
+        let handle = cx.add_window(|_, _| EmptyView);
+        handle
+            .update(cx, |_, window, _| {
+                window.set_magnification(Magnification::new(2., point(px(300.), px(200.))));
+            })
+            .unwrap();
+        let mut platform_window = cx.test_window(handle.into());
+        platform_window.simulate_resize(size(px(400.), px(300.)));
+        handle
+            .update(cx, |_, window, _| {
+                assert_eq!(window.viewport_size(), size(px(400.), px(300.)));
+                assert_eq!(
+                    window.magnification(),
+                    Magnification::new(2., point(px(200.), px(150.)))
+                );
+            })
+            .unwrap();
+        platform_window.simulate_scale_factor_change(2.);
+        handle
+            .update(cx, |_, window, _| {
+                assert_eq!(window.scale_factor(), 2.);
+                assert_eq!(
+                    window.magnification(),
+                    Magnification::new(2., point(px(200.), px(150.)))
+                );
+                assert_eq!(
+                    window.visible_content_bounds(),
+                    Bounds::new(point(px(200.), px(150.)), size(px(200.), px(150.)))
+                );
+                assert_eq!(
+                    window.mouse_position(),
+                    window
+                        .magnification()
+                        .window_to_content(window.mouse_window_position)
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn exact_live_raster_preserves_gesture_caches(cx: &mut TestAppContext) {
         cx.skip_drawing();
         let handle = cx.add_window(|_, _| EmptyView);
