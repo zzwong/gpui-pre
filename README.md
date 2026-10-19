@@ -1,13 +1,3 @@
-# gpui-pre fork maintained for diffz
-
-[`diffz/main`](https://github.com/zzwong/gpui-pre/tree/diffz/main) is the single integration branch. It currently carries the patched published GPUI 0.3.3 snapshot used by diffz. Visual magnification is an experimental spike and remains off by default in the diffz application. Proposed upgrades and patches live on temporary PR branches and join [`diffz/main`](https://github.com/zzwong/gpui-pre/tree/diffz/main) only when accepted.
-
-Historical 0.3.3 commits are preserved by annotated tags: [archive/upstream-baseline](https://github.com/zzwong/gpui-pre/tree/archive/0.3.3-upstream-baseline), [archive/visual-zoom](https://github.com/zzwong/gpui-pre/tree/archive/0.3.3-visual-zoom), [archive/live-pinch-exact-raster](https://github.com/zzwong/gpui-pre/tree/archive/0.3.3-live-pinch-exact-raster), [archive/magnification-polish](https://github.com/zzwong/gpui-pre/tree/archive/0.3.3-magnification-polish). Pin dependency commits by SHA (`rev`), not moving branch names, to keep builds reproducible.
-
-Licensed under Apache-2.0, as is the upstream crate.
-
----
-
 # Welcome to GPUI!
 
 GPUI is a hybrid immediate and retained mode, GPU accelerated, UI framework
