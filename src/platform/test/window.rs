@@ -19,6 +19,8 @@ use std::{
 };
 
 pub(crate) struct TestWindowState {
+    #[cfg(test)]
+    pub(crate) activation_sink: Option<Box<dyn Fn(String)>>,
     pub(crate) bounds: Bounds<Pixels>,
     pub(crate) handle: AnyWindowHandle,
     display: Rc<dyn PlatformDisplay>,
@@ -94,6 +96,8 @@ impl TestWindow {
             None => Arc::new(HeadlessAtlas::default()),
         };
         Self(Rc::new(Mutex::new(TestWindowState {
+            #[cfg(test)]
+            activation_sink: None,
             bounds: params.bounds,
             display,
             platform,
@@ -409,6 +413,28 @@ impl PlatformWindow for TestWindow {
                 .expect("platform dropped")
                 .prompt(msg, detail, answers),
         )
+    }
+
+    fn supports_activation_token(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.0.lock().activation_sink.is_some()
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    fn activate_with_token(&self, token: String) -> bool {
+        #[cfg(test)]
+        if let Some(sink) = self.0.lock().activation_sink.as_ref() {
+            sink(token);
+            return true;
+        }
+        #[cfg(not(test))]
+        let _ = token;
+        false
     }
 
     fn activate(&self) {
