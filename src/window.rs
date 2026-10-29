@@ -6913,6 +6913,19 @@ impl Window {
         self.platform_window.activate();
     }
 
+    /// Whether the target platform window accepts caller-provided activation context.
+    /// This query does not submit or acquire a token.
+    pub fn supports_activation_token(&self) -> bool {
+        self.platform_window.supports_activation_token()
+    }
+
+    /// Consumes and submits activation context on this window when supported.
+    /// `true` means submitted, not compositor acceptance or focus. The token is
+    /// consumed even on `false`; callers must not resend it.
+    pub fn activate_window_with_token(&self, token: String) -> bool {
+        self.platform_window.activate_with_token(token)
+    }
+
     /// Requests that the operating system draw attention to this window.
     pub fn request_attention(&self) {
         self.platform_window.request_attention();
@@ -8177,6 +8190,34 @@ mod tests {
         canvas, div, hsla, point, px, size,
     };
     use crate::{Magnification, ScrollDelta, ScrollWheelEvent};
+
+    #[gpui::test]
+    fn external_activation_dispatches_exactly_once_without_claiming_focus(cx: &mut TestAppContext) {
+        let handle = cx.add_window(|_, _| EmptyView);
+        let platform_window = cx.test_window(handle.into());
+        handle
+            .update(cx, |_, window, _| {
+                assert!(!window.supports_activation_token());
+                assert!(!window.activate_window_with_token("discarded-synthetic".into()));
+            })
+            .unwrap();
+        let observed = Rc::new(RefCell::new(Vec::new()));
+        let sink = observed.clone();
+        platform_window.0.lock().activation_sink =
+            Some(Box::new(move |token| sink.borrow_mut().push(token)));
+        handle
+            .update(cx, |_, window, _| {
+                assert!(window.supports_activation_token());
+                assert!(observed.borrow().is_empty());
+                assert!(window.activate_window_with_token("opaque synthetic \n token".into()));
+                window.activate_window();
+                assert_eq!(observed.borrow().len(), 1);
+            })
+            .unwrap();
+        let tokens = observed.borrow();
+        assert_eq!(tokens.len(), 1);
+        assert!(tokens[0] == "opaque synthetic \n token");
+    }
 
     #[cfg(feature = "profiler")]
     #[gpui::test]

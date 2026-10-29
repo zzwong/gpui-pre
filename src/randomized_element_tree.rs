@@ -1645,23 +1645,42 @@ mod tests {
             .expect("randomized tree window should remain open until the case completes");
     }
 
-    #[gpui::property_test(config = ProptestConfig {
+    #[proptest::property_test(
+        proptest_path = ::gpui::proptest,
+        config = gpui::apply_seed_to_proptest_config(ProptestConfig {
         cases: 4,
         ..Default::default()
-    })]
-    fn randomized_element_tree_matches_full_render(cx: &mut TestAppContext, seed: u64) {
-        for topology in 0..4 {
-            let topology_seed = (seed & !3) | topology;
-            let config = RandomizedElementTreeConfig::new(topology_seed, ELEMENT_COUNT)
-                .with_entity_density(0.2)
-                .with_handler_density(0.2);
-            run_render_equivalence_case(cx, config);
-        }
-        run_render_equivalence_case(
-            cx,
-            RandomizedElementTreeConfig::new(seed, 0)
-                .with_entity_density(0.2)
-                .with_handler_density(0.2),
+        })
+    )]
+    fn randomized_element_tree_matches_full_render(
+        #[strategy = ::gpui::seed_strategy()] __seed: u64,
+        seed: u64,
+    ) {
+        gpui::test::run_test_once(
+            __seed,
+            Box::new(move |dispatcher| {
+                let mut cx = TestAppContext::build(
+                    dispatcher.clone(),
+                    Some(stringify!(randomized_element_tree_matches_full_render)),
+                );
+                for topology in 0..4 {
+                    let topology_seed = (seed & !3) | topology;
+                    let config = RandomizedElementTreeConfig::new(topology_seed, ELEMENT_COUNT)
+                        .with_entity_density(0.2)
+                        .with_handler_density(0.2);
+                    run_render_equivalence_case(&mut cx, config);
+                }
+                run_render_equivalence_case(
+                    &mut cx,
+                    RandomizedElementTreeConfig::new(seed, 0)
+                        .with_entity_density(0.2)
+                        .with_handler_density(0.2),
+                );
+                dispatcher.run_until_parked();
+                cx.executor().forbid_parking();
+                cx.quit();
+                dispatcher.run_until_parked();
+            }),
         );
     }
 

@@ -222,7 +222,7 @@ pub fn guess_compositor() -> &'static str {
 /// variables instead of the ones this process started with. Apply
 /// [`App::graphical_environment`] to the programs an app launches, for the same reason.
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct GraphicalEnvironment {
     /// `WAYLAND_DISPLAY`: a socket name relative to `xdg_runtime_dir`, or an absolute path.
     pub wayland_display: Option<OsString>,
@@ -236,6 +236,21 @@ pub struct GraphicalEnvironment {
     /// it if it starts windowed. Pass one here to switch to windowed mode later, for example
     /// the token of the process that asked for a window.
     pub activation_token: Option<String>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+impl std::fmt::Debug for GraphicalEnvironment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GraphicalEnvironment")
+            .field("wayland_display", &self.wayland_display)
+            .field("x11_display", &self.x11_display)
+            .field("xdg_runtime_dir", &self.xdg_runtime_dir)
+            .field(
+                "activation_token",
+                &self.activation_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 /// The graphical session to connect to: the Windows session whose desktop windows appear on.
@@ -1237,6 +1252,17 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         answers: &[PromptButton],
     ) -> Option<oneshot::Receiver<usize>>;
     fn activate(&self);
+    /// Whether this window can submit caller-provided activation context.
+    /// A capability check never submits or acquires a token.
+    fn supports_activation_token(&self) -> bool {
+        false
+    }
+    /// Consumes caller-provided activation context, even when unsupported.
+    /// `true` means submitted, not compositor acceptance, attention, or focus.
+    /// A caller must not retry an attempted token or infer focus from this result.
+    fn activate_with_token(&self, _token: String) -> bool {
+        false
+    }
     /// Requests that the operating system draw attention to this window.
     fn request_attention(&self) {}
     fn is_active(&self) -> bool;
@@ -3653,6 +3679,31 @@ mod frame_signal_tests {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn graphical_environment_and_nested_windowing_debug_redact_activation_token() {
+        for token in [None, Some("synthetic-private-activation-token".to_owned())] {
+            let present = token.is_some();
+            let environment = GraphicalEnvironment {
+                activation_token: token,
+                wayland_display: Some("wayland-synthetic".into()),
+                ..Default::default()
+            };
+            let direct = format!("{environment:?}");
+            let nested = format!("{:?}", WindowingRequest::Windowed(environment));
+            for formatted in [direct, nested] {
+                // Never dump a formatted carrier on assertion failure.
+                assert!(!formatted.contains("synthetic-private-activation-token"));
+                assert!(formatted.contains("wayland-synthetic"));
+                assert!(formatted.contains(if present {
+                    "<redacted>"
+                } else {
+                    "activation_token: None"
+                }));
+            }
+        }
+    }
 
     #[test]
     fn test_refresh_interval_from_hz() {
